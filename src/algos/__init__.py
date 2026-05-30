@@ -5,3 +5,13 @@ from src.algos.DEER import (
     get_residual,
     merit_fxn,
 )
+
+from src.algos.Picard import (
+    picard_alg,
+    picard_step,
+)
+
+from src.algos.Jacobi import (
+    jacobi_alg,
+    jacobi_step,
+)

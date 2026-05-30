@@ -3,6 +3,8 @@ import time
 import torch
 
 from src.algos.DEER import deer_alg, sequential_rollout
+from src.algos.Picard import picard_alg
+from src.algos.Jacobi import jacobi_alg
 
 
 class SimpleRNNCell(torch.nn.Module):
@@ -39,13 +41,24 @@ def time_function(fn, device):
     return result, elapsed_time
 
 
+def print_report(name, states, info, elapsed_time, true_states):
+    error = torch.max(torch.abs(states - true_states))
+
+    print(f"\n{name}")
+    print("iters:", info["num_iters"])
+    print("time:", elapsed_time)
+    print("initial merit:", info["initial_merit"].item())
+    print("final merit:", info["final_merit"].item())
+    print("max error vs sequential:", error.item())
+
+
 def main():
     torch.manual_seed(0)
 
     device = torch.device("cuda")
     dtype = torch.float64
 
-    T = 1024 * 64
+    T = 1024 * 128
     state_dim = 4
     input_dim = 3
 
@@ -105,8 +118,46 @@ def main():
         device=device,
     )
 
-    deer_error = torch.max(torch.abs(deer_states - true_states))
-    quasi_error = torch.max(torch.abs(quasi_states - true_states))
+    # ------------------------------------------------------------
+    # Picard timing
+    # ------------------------------------------------------------
+    # Picard is cheaper per iteration than DEER, but can need many more iterations.
+    picard_max_iters = 256
+
+    (picard_states, picard_info), picard_time = time_function(
+        lambda: picard_alg(
+            f=f,
+            initial_state=initial_state,
+            states_guess=states_guess,
+            drivers=drivers,
+            num_iters=picard_max_iters,
+            tol=1e-12,
+            clip_value=1e8,
+            return_trace=False,
+        ),
+        device=device,
+    )
+
+    # ------------------------------------------------------------
+    # Jacobi timing
+    # ------------------------------------------------------------
+    # Jacobi can require up to T iterations in the worst case.
+    # For T = 65536, do not start with num_iters=T unless you want a very long run.
+    jacobi_max_iters = 256
+
+    (jacobi_states, jacobi_info), jacobi_time = time_function(
+        lambda: jacobi_alg(
+            f=f,
+            initial_state=initial_state,
+            states_guess=states_guess,
+            drivers=drivers,
+            num_iters=jacobi_max_iters,
+            tol=1e-12,
+            clip_value=1e8,
+            return_trace=False,
+        ),
+        device=device,
+    )
 
     print("Device:", device)
 
@@ -115,19 +166,13 @@ def main():
     print("final merit:", 0.0)
     print("max error vs sequential:", 0.0)
 
-    print("\nFull DEER")
-    print("iters:", deer_info["num_iters"])
-    print("time:", deer_time)
-    print("initial merit:", deer_info["initial_merit"].item())
-    print("final merit:", deer_info["final_merit"].item())
-    print("max error vs sequential:", deer_error.item())
-
-    print("\nQuasi-DEER")
-    print("iters:", quasi_info["num_iters"])
-    print("time:", quasi_time)
-    print("initial merit:", quasi_info["initial_merit"].item())
-    print("final merit:", quasi_info["final_merit"].item())
-    print("max error vs sequential:", quasi_error.item())
+    print_report("Full DEER", deer_states, deer_info, deer_time, true_states)
+    print_report("Quasi-DEER", quasi_states,
+                 quasi_info, quasi_time, true_states)
+    print_report("Picard", picard_states, picard_info,
+                 picard_time, true_states)
+    print_report("Jacobi", jacobi_states, jacobi_info,
+                 jacobi_time, true_states)
 
 
 if __name__ == "__main__":
