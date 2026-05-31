@@ -1,0 +1,759 @@
+2026-05-31 16:04:04 | INFO | Benchmark arguments:
+2026-05-31 16:04:04 | INFO | {
+  "run_name": "quick_torch_warp_float64_20260531_160403",
+  "min_seq_len": 1024,
+  "max_seq_len": 8192,
+  "state_dim": 4,
+  "input_dim": 3,
+  "dtype": "float64",
+  "device": "cuda",
+  "warmup": 0,
+  "repeats": 1,
+  "seed": 0,
+  "algorithms": "all",
+  "scan_backend": "torch",
+  "accel_module": "warp",
+  "elk_sigmasq": 100000000.0,
+  "quasi_elk_sigmasq": 100000000.0,
+  "elk_process_noise": 1.0,
+  "max_iters_deer": null,
+  "max_iters_quasi_deer": null,
+  "max_iters_picard": 256,
+  "max_iters_jacobi": 256,
+  "max_iters_elk": 64,
+  "max_iters_quasi_elk": 64,
+  "tol": 1e-12,
+  "clip_value": 100000000.0,
+  "stopping_criterion": "update",
+  "strict_tol": false,
+  "valid_final_merit_threshold": 1e-06,
+  "valid_error_threshold": 0.0001,
+  "stop_on_error": false,
+  "log_file": "/home/cpt/Documents/Github/Parallel-RNN/test/bench/logs/quick_torch_warp_float64_20260531_160403.log",
+  "csv_file": "/home/cpt/Documents/Github/Parallel-RNN/test/bench/logs/quick_torch_warp_float64_20260531_160403.csv"
+}
+2026-05-31 16:04:04 | INFO | Project root: /home/cpt/Documents/Github/Parallel-RNN
+2026-05-31 16:04:04 | INFO | Benchmark directory: /home/cpt/Documents/Github/Parallel-RNN/test/bench
+2026-05-31 16:04:04 | INFO | Logs directory: /home/cpt/Documents/Github/Parallel-RNN/test/bench/logs
+2026-05-31 16:04:04 | INFO | Sequence sizes: [1024, 2048, 4096, 8192]
+2026-05-31 16:04:04 | INFO | Using torch version: 2.11.0+cu128
+2026-05-31 16:04:04 | INFO | CUDA device: NVIDIA GeForce RTX 3070 Laptop GPU
+2026-05-31 16:04:04 | INFO | ================================================================================
+2026-05-31 16:04:04 | INFO | Starting sequence length: 1024
+2026-05-31 16:04:04 | INFO | ================================================================================
+2026-05-31 16:04:04 | INFO | Starting sequential baseline
+2026-05-31 16:04:04 | INFO | Sequential repeat 1/1 done: 0.150310 s | peak allocated 9.68 MB
+2026-05-31 16:04:04 | INFO | Finished sequential baseline
+2026-05-31 16:04:04 | INFO | {
+  "method": "Sequential Evaluation",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "num_iters": null,
+  "initial_merit": 0.0,
+  "final_merit": 0.0,
+  "last_update_error": 0.0,
+  "tol": null,
+  "effective_tol": null,
+  "strict_tol": null,
+  "stopping_criterion": null,
+  "max_error_vs_sequential": 0.0,
+  "time_min_s": 0.15031026099677547,
+  "time_mean_s": 0.15031026099677547,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 9.681640625,
+  "peak_memory_reserved_mb": 22.0,
+  "valid_solution": true,
+  "validation_reason": "sequential_baseline"
+}
+2026-05-31 16:04:04 | INFO | Starting method: Full DEER / Newton
+2026-05-31 16:04:06 | INFO | Repeat 1/1 done for Full DEER / Newton: 1.283565 s | peak allocated 18.20 MB
+2026-05-31 16:04:06 | INFO | Finished method: Full DEER / Newton
+2026-05-31 16:04:06 | INFO | {
+  "method": "Full DEER / Newton",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "max_error_vs_sequential": 4.440892098500626e-16,
+  "num_iters": 5,
+  "initial_merit": 287.308986317204,
+  "final_merit": 4.142312608311879e-30,
+  "last_update_error": 6.072364833187294e-12,
+  "tol": 1e-12,
+  "effective_tol": 1e-07,
+  "strict_tol": false,
+  "stopping_criterion": "update",
+  "time_min_s": 1.283565316000022,
+  "time_mean_s": 1.283565316000022,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 18.19921875,
+  "peak_memory_reserved_mb": 24.0,
+  "valid_solution": true,
+  "validation_reason": "passed"
+}
+2026-05-31 16:04:06 | INFO | Starting method: Quasi-DEER / Quasi-Newton
+2026-05-31 16:04:06 | INFO | Repeat 1/1 done for Quasi-DEER / Quasi-Newton: 0.164138 s | peak allocated 17.78 MB
+2026-05-31 16:04:06 | INFO | Finished method: Quasi-DEER / Quasi-Newton
+2026-05-31 16:04:06 | INFO | {
+  "method": "Quasi-DEER / Quasi-Newton",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "max_error_vs_sequential": 1.3376712959534132e-08,
+  "num_iters": 16,
+  "initial_merit": 287.308986317204,
+  "final_merit": 9.889956940086536e-16,
+  "last_update_error": 2.81442440741575e-08,
+  "tol": 1e-12,
+  "effective_tol": 1e-07,
+  "strict_tol": false,
+  "stopping_criterion": "update",
+  "time_min_s": 0.16413845400165883,
+  "time_mean_s": 0.16413845400165883,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 17.77734375,
+  "peak_memory_reserved_mb": 22.0,
+  "valid_solution": true,
+  "validation_reason": "passed"
+}
+2026-05-31 16:04:06 | INFO | Starting method: Picard
+2026-05-31 16:04:06 | INFO | Repeat 1/1 done for Picard: 0.148639 s | peak allocated 17.50 MB
+2026-05-31 16:04:06 | INFO | Finished method: Picard
+2026-05-31 16:04:06 | INFO | {
+  "method": "Picard",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "max_error_vs_sequential": 100000000.98566128,
+  "num_iters": 256,
+  "initial_merit": 287.308986317204,
+  "final_merit": 1.5299574841202311e+19,
+  "last_update_error": null,
+  "tol": null,
+  "effective_tol": null,
+  "strict_tol": null,
+  "stopping_criterion": null,
+  "time_min_s": 0.14863854199938942,
+  "time_mean_s": 0.14863854199938942,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 17.4951171875,
+  "peak_memory_reserved_mb": 22.0,
+  "valid_solution": false,
+  "validation_reason": "final_merit_too_large:1.5299574841202311e+19>=1e-06"
+}
+2026-05-31 16:04:06 | INFO | Starting method: Jacobi
+2026-05-31 16:04:06 | INFO | Repeat 1/1 done for Jacobi: 0.011931 s | peak allocated 17.46 MB
+2026-05-31 16:04:06 | INFO | Finished method: Jacobi
+2026-05-31 16:04:06 | INFO | {
+  "method": "Jacobi",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "max_error_vs_sequential": 2.6644845887990876e-07,
+  "num_iters": 20,
+  "initial_merit": 287.308986317204,
+  "final_merit": 3.445481124431313e-13,
+  "last_update_error": null,
+  "tol": null,
+  "effective_tol": null,
+  "strict_tol": null,
+  "stopping_criterion": null,
+  "time_min_s": 0.011930641998333158,
+  "time_mean_s": 0.011930641998333158,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 17.4638671875,
+  "peak_memory_reserved_mb": 22.0,
+  "valid_solution": true,
+  "validation_reason": "passed"
+}
+2026-05-31 16:04:06 | INFO | Starting method: ELK
+2026-05-31 16:04:07 | INFO | Repeat 1/1 done for ELK: 0.148933 s | peak allocated 19.03 MB
+2026-05-31 16:04:07 | INFO | Finished method: ELK
+2026-05-31 16:04:07 | INFO | {
+  "method": "ELK",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "max_error_vs_sequential": 4.440892098500626e-16,
+  "num_iters": 5,
+  "initial_merit": 287.308986317204,
+  "final_merit": 6.37261937050838e-30,
+  "last_update_error": 6.180167488878396e-12,
+  "tol": 1e-12,
+  "effective_tol": 1e-07,
+  "strict_tol": false,
+  "stopping_criterion": "update",
+  "time_min_s": 0.14893267099978402,
+  "time_mean_s": 0.14893267099978402,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 19.02685546875,
+  "peak_memory_reserved_mb": 24.0,
+  "valid_solution": true,
+  "validation_reason": "passed"
+}
+2026-05-31 16:04:07 | INFO | Starting method: Quasi-ELK
+2026-05-31 16:04:07 | INFO | Repeat 1/1 done for Quasi-ELK: 0.143681 s | peak allocated 17.95 MB
+2026-05-31 16:04:07 | INFO | Finished method: Quasi-ELK
+2026-05-31 16:04:07 | INFO | {
+  "method": "Quasi-ELK",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "max_error_vs_sequential": 1.33767185730993e-08,
+  "num_iters": 16,
+  "initial_merit": 287.308986317204,
+  "final_merit": 9.889963334125361e-16,
+  "last_update_error": 2.8144247939121403e-08,
+  "tol": 1e-12,
+  "effective_tol": 1e-07,
+  "strict_tol": false,
+  "stopping_criterion": "update",
+  "time_min_s": 0.14368080200074473,
+  "time_mean_s": 0.14368080200074473,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 17.94873046875,
+  "peak_memory_reserved_mb": 22.0,
+  "valid_solution": true,
+  "validation_reason": "passed"
+}
+2026-05-31 16:04:07 | INFO | Finished sequence length: 1024
+2026-05-31 16:04:07 | INFO | ================================================================================
+2026-05-31 16:04:07 | INFO | Starting sequence length: 2048
+2026-05-31 16:04:07 | INFO | ================================================================================
+2026-05-31 16:04:07 | INFO | Starting sequential baseline
+2026-05-31 16:04:07 | INFO | Sequential repeat 1/1 done: 0.110304 s | peak allocated 18.36 MB
+2026-05-31 16:04:07 | INFO | Finished sequential baseline
+2026-05-31 16:04:07 | INFO | {
+  "method": "Sequential Evaluation",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "num_iters": null,
+  "initial_merit": 0.0,
+  "final_merit": 0.0,
+  "last_update_error": 0.0,
+  "tol": null,
+  "effective_tol": null,
+  "strict_tol": null,
+  "stopping_criterion": null,
+  "max_error_vs_sequential": 0.0,
+  "time_min_s": 0.11030446699805907,
+  "time_mean_s": 0.11030446699805907,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 18.361328125,
+  "peak_memory_reserved_mb": 24.0,
+  "valid_solution": true,
+  "validation_reason": "sequential_baseline"
+}
+2026-05-31 16:04:07 | INFO | Starting method: Full DEER / Newton
+2026-05-31 16:04:07 | INFO | Repeat 1/1 done for Full DEER / Newton: 0.060333 s | peak allocated 19.14 MB
+2026-05-31 16:04:07 | INFO | Finished method: Full DEER / Newton
+2026-05-31 16:04:07 | INFO | {
+  "method": "Full DEER / Newton",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "max_error_vs_sequential": 3.3306690738754696e-16,
+  "num_iters": 4,
+  "initial_merit": 917.8131106554378,
+  "final_merit": 1.515344831191857e-29,
+  "last_update_error": 7.976404758913702e-09,
+  "tol": 1e-12,
+  "effective_tol": 1e-07,
+  "strict_tol": false,
+  "stopping_criterion": "update",
+  "time_min_s": 0.060333138000714825,
+  "time_mean_s": 0.060333138000714825,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 19.14453125,
+  "peak_memory_reserved_mb": 24.0,
+  "valid_solution": true,
+  "validation_reason": "passed"
+}
+2026-05-31 16:04:07 | INFO | Starting method: Quasi-DEER / Quasi-Newton
+2026-05-31 16:04:07 | INFO | Repeat 1/1 done for Quasi-DEER / Quasi-Newton: 0.072897 s | peak allocated 18.30 MB
+2026-05-31 16:04:07 | INFO | Finished method: Quasi-DEER / Quasi-Newton
+2026-05-31 16:04:07 | INFO | {
+  "method": "Quasi-DEER / Quasi-Newton",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "max_error_vs_sequential": 1.0282671603079052e-08,
+  "num_iters": 14,
+  "initial_merit": 917.8131106554378,
+  "final_merit": 1.967943853160136e-15,
+  "last_update_error": 4.288524062256993e-08,
+  "tol": 1e-12,
+  "effective_tol": 1e-07,
+  "strict_tol": false,
+  "stopping_criterion": "update",
+  "time_min_s": 0.0728974970006675,
+  "time_mean_s": 0.0728974970006675,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 18.30078125,
+  "peak_memory_reserved_mb": 24.0,
+  "valid_solution": true,
+  "validation_reason": "passed"
+}
+2026-05-31 16:04:07 | INFO | Starting method: Picard
+2026-05-31 16:04:08 | INFO | Repeat 1/1 done for Picard: 0.184172 s | peak allocated 17.74 MB
+2026-05-31 16:04:08 | INFO | Finished method: Picard
+2026-05-31 16:04:08 | INFO | {
+  "method": "Picard",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "max_error_vs_sequential": 100000000.9925161,
+  "num_iters": 256,
+  "initial_merit": 917.8131106554378,
+  "final_merit": 3.5780012638418297e+19,
+  "last_update_error": null,
+  "tol": null,
+  "effective_tol": null,
+  "strict_tol": null,
+  "stopping_criterion": null,
+  "time_min_s": 0.18417199599934975,
+  "time_mean_s": 0.18417199599934975,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 17.7373046875,
+  "peak_memory_reserved_mb": 22.0,
+  "valid_solution": false,
+  "validation_reason": "final_merit_too_large:3.5780012638418297e+19>=1e-06"
+}
+2026-05-31 16:04:08 | INFO | Starting method: Jacobi
+2026-05-31 16:04:08 | INFO | Repeat 1/1 done for Jacobi: 0.008357 s | peak allocated 17.67 MB
+2026-05-31 16:04:08 | INFO | Finished method: Jacobi
+2026-05-31 16:04:08 | INFO | {
+  "method": "Jacobi",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "max_error_vs_sequential": 1.1031643437631189e-07,
+  "num_iters": 19,
+  "initial_merit": 917.8131106554378,
+  "final_merit": 2.0786784187931612e-13,
+  "last_update_error": null,
+  "tol": null,
+  "effective_tol": null,
+  "strict_tol": null,
+  "stopping_criterion": null,
+  "time_min_s": 0.00835696200010716,
+  "time_mean_s": 0.00835696200010716,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 17.6748046875,
+  "peak_memory_reserved_mb": 22.0,
+  "valid_solution": true,
+  "validation_reason": "passed"
+}
+2026-05-31 16:04:08 | INFO | Starting method: ELK
+2026-05-31 16:04:08 | INFO | Repeat 1/1 done for ELK: 0.084459 s | peak allocated 20.80 MB
+2026-05-31 16:04:08 | INFO | Finished method: ELK
+2026-05-31 16:04:08 | INFO | {
+  "method": "ELK",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "max_error_vs_sequential": 4.440892098500626e-16,
+  "num_iters": 4,
+  "initial_merit": 917.8131106554378,
+  "final_merit": 1.8766037010308623e-29,
+  "last_update_error": 7.980316740763271e-09,
+  "tol": 1e-12,
+  "effective_tol": 1e-07,
+  "strict_tol": false,
+  "stopping_criterion": "update",
+  "time_min_s": 0.08445924799889326,
+  "time_mean_s": 0.08445924799889326,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 20.80029296875,
+  "peak_memory_reserved_mb": 26.0,
+  "valid_solution": true,
+  "validation_reason": "passed"
+}
+2026-05-31 16:04:08 | INFO | Starting method: Quasi-ELK
+2026-05-31 16:04:08 | INFO | Repeat 1/1 done for Quasi-ELK: 0.128276 s | peak allocated 18.64 MB
+2026-05-31 16:04:08 | INFO | Finished method: Quasi-ELK
+2026-05-31 16:04:08 | INFO | {
+  "method": "Quasi-ELK",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "max_error_vs_sequential": 1.0282671214500994e-08,
+  "num_iters": 14,
+  "initial_merit": 917.8131106554378,
+  "final_merit": 1.9679427094134e-15,
+  "last_update_error": 4.288522958278973e-08,
+  "tol": 1e-12,
+  "effective_tol": 1e-07,
+  "strict_tol": false,
+  "stopping_criterion": "update",
+  "time_min_s": 0.12827643200216698,
+  "time_mean_s": 0.12827643200216698,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 18.64404296875,
+  "peak_memory_reserved_mb": 24.0,
+  "valid_solution": true,
+  "validation_reason": "passed"
+}
+2026-05-31 16:04:08 | INFO | Finished sequence length: 2048
+2026-05-31 16:04:08 | INFO | ================================================================================
+2026-05-31 16:04:08 | INFO | Starting sequence length: 4096
+2026-05-31 16:04:08 | INFO | ================================================================================
+2026-05-31 16:04:08 | INFO | Starting sequential baseline
+2026-05-31 16:04:08 | INFO | Sequential repeat 1/1 done: 0.195448 s | peak allocated 19.47 MB
+2026-05-31 16:04:08 | INFO | Finished sequential baseline
+2026-05-31 16:04:08 | INFO | {
+  "method": "Sequential Evaluation",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "num_iters": null,
+  "initial_merit": 0.0,
+  "final_merit": 0.0,
+  "last_update_error": 0.0,
+  "tol": null,
+  "effective_tol": null,
+  "strict_tol": null,
+  "stopping_criterion": null,
+  "max_error_vs_sequential": 0.0,
+  "time_min_s": 0.19544811400191975,
+  "time_mean_s": 0.19544811400191975,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 19.470703125,
+  "peak_memory_reserved_mb": 24.0,
+  "valid_solution": true,
+  "validation_reason": "sequential_baseline"
+}
+2026-05-31 16:04:08 | INFO | Starting method: Full DEER / Newton
+2026-05-31 16:04:08 | INFO | Repeat 1/1 done for Full DEER / Newton: 0.038769 s | peak allocated 21.04 MB
+2026-05-31 16:04:08 | INFO | Finished method: Full DEER / Newton
+2026-05-31 16:04:08 | INFO | {
+  "method": "Full DEER / Newton",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "max_error_vs_sequential": 4.440892098500626e-16,
+  "num_iters": 5,
+  "initial_merit": 1796.5947142967843,
+  "final_merit": 2.2570613335485342e-29,
+  "last_update_error": 1.2212453270876722e-14,
+  "tol": 1e-12,
+  "effective_tol": 1e-07,
+  "strict_tol": false,
+  "stopping_criterion": "update",
+  "time_min_s": 0.03876867299914011,
+  "time_mean_s": 0.03876867299914011,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 21.03515625,
+  "peak_memory_reserved_mb": 26.0,
+  "valid_solution": true,
+  "validation_reason": "passed"
+}
+2026-05-31 16:04:08 | INFO | Starting method: Quasi-DEER / Quasi-Newton
+2026-05-31 16:04:09 | INFO | Repeat 1/1 done for Quasi-DEER / Quasi-Newton: 0.087155 s | peak allocated 19.35 MB
+2026-05-31 16:04:09 | INFO | Finished method: Quasi-DEER / Quasi-Newton
+2026-05-31 16:04:09 | INFO | {
+  "method": "Quasi-DEER / Quasi-Newton",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "max_error_vs_sequential": 8.106682602981863e-09,
+  "num_iters": 16,
+  "initial_merit": 1796.5947142967843,
+  "final_merit": 2.0357228443674232e-15,
+  "last_update_error": 2.8799822193725788e-08,
+  "tol": 1e-12,
+  "effective_tol": 1e-07,
+  "strict_tol": false,
+  "stopping_criterion": "update",
+  "time_min_s": 0.08715494300122373,
+  "time_mean_s": 0.08715494300122373,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 19.34765625,
+  "peak_memory_reserved_mb": 24.0,
+  "valid_solution": true,
+  "validation_reason": "passed"
+}
+2026-05-31 16:04:09 | INFO | Starting method: Picard
+2026-05-31 16:04:09 | INFO | Repeat 1/1 done for Picard: 0.258996 s | peak allocated 18.22 MB
+2026-05-31 16:04:09 | INFO | Finished method: Picard
+2026-05-31 16:04:09 | INFO | {
+  "method": "Picard",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "max_error_vs_sequential": 100000000.99218476,
+  "num_iters": 256,
+  "initial_merit": 1796.5947142967843,
+  "final_merit": 7.673229647299514e+19,
+  "last_update_error": null,
+  "tol": null,
+  "effective_tol": null,
+  "strict_tol": null,
+  "stopping_criterion": null,
+  "time_min_s": 0.2589960709992738,
+  "time_mean_s": 0.2589960709992738,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 18.2216796875,
+  "peak_memory_reserved_mb": 22.0,
+  "valid_solution": false,
+  "validation_reason": "final_merit_too_large:7.673229647299514e+19>=1e-06"
+}
+2026-05-31 16:04:09 | INFO | Starting method: Jacobi
+2026-05-31 16:04:09 | INFO | Repeat 1/1 done for Jacobi: 0.010636 s | peak allocated 18.10 MB
+2026-05-31 16:04:09 | INFO | Finished method: Jacobi
+2026-05-31 16:04:09 | INFO | {
+  "method": "Jacobi",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "max_error_vs_sequential": 2.314393300062445e-07,
+  "num_iters": 19,
+  "initial_merit": 1796.5947142967843,
+  "final_merit": 3.1462166579050264e-13,
+  "last_update_error": null,
+  "tol": null,
+  "effective_tol": null,
+  "strict_tol": null,
+  "stopping_criterion": null,
+  "time_min_s": 0.010635541002557147,
+  "time_mean_s": 0.010635541002557147,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 18.0966796875,
+  "peak_memory_reserved_mb": 22.0,
+  "valid_solution": true,
+  "validation_reason": "passed"
+}
+2026-05-31 16:04:09 | INFO | Starting method: ELK
+2026-05-31 16:04:09 | INFO | Repeat 1/1 done for ELK: 0.126446 s | peak allocated 24.35 MB
+2026-05-31 16:04:09 | INFO | Finished method: ELK
+2026-05-31 16:04:09 | INFO | {
+  "method": "ELK",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "max_error_vs_sequential": 4.440892098500626e-16,
+  "num_iters": 5,
+  "initial_merit": 1796.5947142967843,
+  "final_merit": 3.3570870021926274e-29,
+  "last_update_error": 1.7541523789077473e-14,
+  "tol": 1e-12,
+  "effective_tol": 1e-07,
+  "strict_tol": false,
+  "stopping_criterion": "update",
+  "time_min_s": 0.12644645199907245,
+  "time_mean_s": 0.12644645199907245,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 24.34716796875,
+  "peak_memory_reserved_mb": 30.0,
+  "valid_solution": true,
+  "validation_reason": "passed"
+}
+2026-05-31 16:04:09 | INFO | Starting method: Quasi-ELK
+2026-05-31 16:04:10 | INFO | Repeat 1/1 done for Quasi-ELK: 0.163307 s | peak allocated 20.03 MB
+2026-05-31 16:04:10 | INFO | Finished method: Quasi-ELK
+2026-05-31 16:04:10 | INFO | {
+  "method": "Quasi-ELK",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "max_error_vs_sequential": 8.10668041029139e-09,
+  "num_iters": 16,
+  "initial_merit": 1796.5947142967843,
+  "final_merit": 2.0357231017278978e-15,
+  "last_update_error": 2.87998092041164e-08,
+  "tol": 1e-12,
+  "effective_tol": 1e-07,
+  "strict_tol": false,
+  "stopping_criterion": "update",
+  "time_min_s": 0.16330692200062913,
+  "time_mean_s": 0.16330692200062913,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 20.03466796875,
+  "peak_memory_reserved_mb": 26.0,
+  "valid_solution": true,
+  "validation_reason": "passed"
+}
+2026-05-31 16:04:10 | INFO | Finished sequence length: 4096
+2026-05-31 16:04:10 | INFO | ================================================================================
+2026-05-31 16:04:10 | INFO | Starting sequence length: 8192
+2026-05-31 16:04:10 | INFO | ================================================================================
+2026-05-31 16:04:10 | INFO | Starting sequential baseline
+2026-05-31 16:04:10 | INFO | Sequential repeat 1/1 done: 0.368732 s | peak allocated 21.69 MB
+2026-05-31 16:04:10 | INFO | Finished sequential baseline
+2026-05-31 16:04:10 | INFO | {
+  "method": "Sequential Evaluation",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "num_iters": null,
+  "initial_merit": 0.0,
+  "final_merit": 0.0,
+  "last_update_error": 0.0,
+  "tol": null,
+  "effective_tol": null,
+  "strict_tol": null,
+  "stopping_criterion": null,
+  "max_error_vs_sequential": 0.0,
+  "time_min_s": 0.36873219200060703,
+  "time_mean_s": 0.36873219200060703,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 21.689453125,
+  "peak_memory_reserved_mb": 26.0,
+  "valid_solution": true,
+  "validation_reason": "sequential_baseline"
+}
+2026-05-31 16:04:10 | INFO | Starting method: Full DEER / Newton
+2026-05-31 16:04:10 | INFO | Repeat 1/1 done for Full DEER / Newton: 0.037381 s | peak allocated 24.82 MB
+2026-05-31 16:04:10 | INFO | Finished method: Full DEER / Newton
+2026-05-31 16:04:10 | INFO | {
+  "method": "Full DEER / Newton",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "max_error_vs_sequential": 3.3306690738754696e-16,
+  "num_iters": 4,
+  "initial_merit": 2552.8384872484285,
+  "final_merit": 5.292811361929248e-29,
+  "last_update_error": 8.563842524011989e-09,
+  "tol": 1e-12,
+  "effective_tol": 1e-07,
+  "strict_tol": false,
+  "stopping_criterion": "update",
+  "time_min_s": 0.03738059000170324,
+  "time_mean_s": 0.03738059000170324,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 24.81640625,
+  "peak_memory_reserved_mb": 30.0,
+  "valid_solution": true,
+  "validation_reason": "passed"
+}
+2026-05-31 16:04:10 | INFO | Starting method: Quasi-DEER / Quasi-Newton
+2026-05-31 16:04:10 | INFO | Repeat 1/1 done for Quasi-DEER / Quasi-Newton: 0.074994 s | peak allocated 21.44 MB
+2026-05-31 16:04:10 | INFO | Finished method: Quasi-DEER / Quasi-Newton
+2026-05-31 16:04:10 | INFO | {
+  "method": "Quasi-DEER / Quasi-Newton",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "max_error_vs_sequential": 3.872530962567566e-09,
+  "num_iters": 13,
+  "initial_merit": 2552.8384872484285,
+  "final_merit": 1.7307232586489795e-15,
+  "last_update_error": 2.6601543579030107e-08,
+  "tol": 1e-12,
+  "effective_tol": 1e-07,
+  "strict_tol": false,
+  "stopping_criterion": "update",
+  "time_min_s": 0.0749937830005365,
+  "time_mean_s": 0.0749937830005365,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 21.44140625,
+  "peak_memory_reserved_mb": 26.0,
+  "valid_solution": true,
+  "validation_reason": "passed"
+}
+2026-05-31 16:04:10 | INFO | Starting method: Picard
+2026-05-31 16:04:11 | INFO | Repeat 1/1 done for Picard: 0.439580 s | peak allocated 19.19 MB
+2026-05-31 16:04:11 | INFO | Finished method: Picard
+2026-05-31 16:04:11 | INFO | {
+  "method": "Picard",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "max_error_vs_sequential": 100000000.95823202,
+  "num_iters": 256,
+  "initial_merit": 2552.8384872484285,
+  "final_merit": 1.5864005891577525e+20,
+  "last_update_error": null,
+  "tol": null,
+  "effective_tol": null,
+  "strict_tol": null,
+  "stopping_criterion": null,
+  "time_min_s": 0.43957997700272244,
+  "time_mean_s": 0.43957997700272244,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 19.1904296875,
+  "peak_memory_reserved_mb": 24.0,
+  "valid_solution": false,
+  "validation_reason": "final_merit_too_large:1.5864005891577525e+20>=1e-06"
+}
+2026-05-31 16:04:11 | INFO | Starting method: Jacobi
+2026-05-31 16:04:11 | INFO | Repeat 1/1 done for Jacobi: 0.009501 s | peak allocated 18.94 MB
+2026-05-31 16:04:11 | INFO | Finished method: Jacobi
+2026-05-31 16:04:11 | INFO | {
+  "method": "Jacobi",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "max_error_vs_sequential": 1.285830296404722e-07,
+  "num_iters": 15,
+  "initial_merit": 2552.8384872484285,
+  "final_merit": 9.552972486245546e-13,
+  "last_update_error": null,
+  "tol": null,
+  "effective_tol": null,
+  "strict_tol": null,
+  "stopping_criterion": null,
+  "time_min_s": 0.009501451000687666,
+  "time_mean_s": 0.009501451000687666,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 18.9404296875,
+  "peak_memory_reserved_mb": 24.0,
+  "valid_solution": true,
+  "validation_reason": "passed"
+}
+2026-05-31 16:04:11 | INFO | Starting method: ELK
+2026-05-31 16:04:11 | INFO | Repeat 1/1 done for ELK: 0.130014 s | peak allocated 31.44 MB
+2026-05-31 16:04:11 | INFO | Finished method: ELK
+2026-05-31 16:04:11 | INFO | {
+  "method": "ELK",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "max_error_vs_sequential": 4.996003610813204e-16,
+  "num_iters": 4,
+  "initial_merit": 2552.8384872484285,
+  "final_merit": 6.567329496822101e-29,
+  "last_update_error": 8.565381737213329e-09,
+  "tol": 1e-12,
+  "effective_tol": 1e-07,
+  "strict_tol": false,
+  "stopping_criterion": "update",
+  "time_min_s": 0.13001445500049158,
+  "time_mean_s": 0.13001445500049158,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 31.44091796875,
+  "peak_memory_reserved_mb": 36.0,
+  "valid_solution": true,
+  "validation_reason": "passed"
+}
+2026-05-31 16:04:11 | INFO | Starting method: Quasi-ELK
+2026-05-31 16:04:11 | INFO | Repeat 1/1 done for Quasi-ELK: 0.143737 s | peak allocated 22.82 MB
+2026-05-31 16:04:11 | INFO | Finished method: Quasi-ELK
+2026-05-31 16:04:11 | INFO | {
+  "method": "Quasi-ELK",
+  "status": "ok",
+  "error_message": "",
+  "successful_repeats": 1,
+  "max_error_vs_sequential": 3.872527604142917e-09,
+  "num_iters": 13,
+  "initial_merit": 2552.8384872484285,
+  "final_merit": 1.730720579577382e-15,
+  "last_update_error": 2.660152209621458e-08,
+  "tol": 1e-12,
+  "effective_tol": 1e-07,
+  "strict_tol": false,
+  "stopping_criterion": "update",
+  "time_min_s": 0.14373731600062456,
+  "time_mean_s": 0.14373731600062456,
+  "time_std_s": 0.0,
+  "peak_memory_allocated_mb": 22.81591796875,
+  "peak_memory_reserved_mb": 28.0,
+  "valid_solution": true,
+  "validation_reason": "passed"
+}
+2026-05-31 16:04:11 | INFO | Finished sequence length: 8192
+2026-05-31 16:04:11 | INFO | Benchmark complete.
+2026-05-31 16:04:11 | INFO | Log saved to: /home/cpt/Documents/Github/Parallel-RNN/test/bench/logs/quick_torch_warp_float64_20260531_160403.log
+2026-05-31 16:04:11 | INFO | CSV saved to: /home/cpt/Documents/Github/Parallel-RNN/test/bench/logs/quick_torch_warp_float64_20260531_160403.csv

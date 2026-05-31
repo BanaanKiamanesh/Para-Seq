@@ -1,1 +1,2 @@
 torch==2.11.0+cu128
+accelerated-scan>=0.3.1
