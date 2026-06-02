@@ -1,8 +1,15 @@
 __pycache__/
 *.py[cod]
+.pytest_cache/
 
 .venv/
 venv/
 .vscode/
 
 .DS_Store
+
+notebooks/
+notebooks/data/
+
+test/bench/logs/*.csv
+test/bench/logs/*.log

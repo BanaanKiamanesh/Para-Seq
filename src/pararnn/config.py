@@ -12,6 +12,7 @@ ScanBackend = Literal["torch", "accel_scan"]
 StoppingCriterion = Literal["update", "merit"]
 InitialGuess = Literal["zero", "f0"]
 JacobianBackend = Literal["autograd", "explicit"]
+BackwardBackend = Literal["autograd", "adjoint"]
 
 
 @dataclass
@@ -35,6 +36,15 @@ class DeerNewtonConfig:
 
             For the current ParaGRU implementation, this backend is valid with
             quasi=True because ParaGRU provides diagonal Jacobians.
+
+    backward_backend:
+        "autograd":
+            Differentiate through the full DEER computation graph.
+
+        "adjoint":
+            Do not backpropagate through Newton/DEER iterations. Instead, use a
+            ParaRNN-style reverse-time adjoint recurrence. This is currently
+            implemented for explicit quasi-DEER ParaGRU only.
     """
 
     num_iters: int = 4
@@ -49,6 +59,7 @@ class DeerNewtonConfig:
     stopping_criterion: StoppingCriterion = "update"
     initial_guess: InitialGuess = "f0"
     jacobian_backend: JacobianBackend = "autograd"
+    backward_backend: BackwardBackend = "autograd"
 
 
 @dataclass

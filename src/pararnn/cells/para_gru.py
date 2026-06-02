@@ -1,123 +1,589 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
+from torch import nn
 
+from src.algos.DEER import merit_fxn_batched
+from src.pararnn.adjoint import (
+    functional_paragru_input_projection,
+    functional_paragru_linearization_diag_from_previous,
+    functional_paragru_recurrence_step,
+    paragru_adjoint_deer_forward,
+)
 from src.pararnn.base_cell import BaseParaRNNCell
-from src.pararnn.config import ParaRNNConfig
+from src.pararnn.config import DeerNewtonConfig, ParaRNNConfig
+
+
+ParaGRUBackend = Literal[
+    "autograd",
+    "adjoint",
+    "deer_autograd_torch",
+    "deer_adjoint_torch",
+    "deer_adjoint_accel_scan",
+]
 
 
 @dataclass
 class ParaGRUConfig(ParaRNNConfig):
-    """Configuration for the simple diagonal ParaGRU cell.
+    """Configuration used internally by the sequence-level ParaGRU.
 
-    This is the first real ParaRNN-style cell in this repository.
-
-    For now we implement the non-multi-head version:
-
-        A: (3, state_dim)
-        B: (3, input_dim, state_dim)
-        b: (3, state_dim)
-
-    Later we will upgrade this to the multi-head ParaRNN layout:
-
-        B: (num_heads, head_input_dim, 3, head_state_dim)
+    The public API is intentionally PyTorch-like and does not require users to
+    instantiate this dataclass directly. It remains available for low-level and
+    backward-compatible tests.
     """
 
     recurrent_init_scale: float = 0.25
     input_init_scale: float = 1.0
     bias_init_value: float = 0.0
+    bias: bool = True
 
 
-class ParaGRUCell(BaseParaRNNCell):
-    """Diagonal ParaGRU cell.
+def make_paragru_deer_config(
+    backend: ParaGRUBackend = "adjoint",
+    *,
+    num_iters: int = 4,
+    tol: float | None = None,
+    strict_tol: bool = False,
+    initial_guess: str = "f0",
+    scan_backend: Literal["torch", "accel_scan"] = "torch",
+    accel_module: str = "warp",
+) -> DeerNewtonConfig:
+    """Construct a DEER config for ParaGRU.
 
-    Recurrence:
+    Args:
+        backend:
+            "autograd" differentiates through DEER iterations.
+            "adjoint" uses the custom ParaGRU adjoint backward.
+            The longer legacy names are also accepted.
+    """
+    if backend == "deer_autograd_torch":
+        backend = "autograd"
+        scan_backend = "torch"
+    elif backend == "deer_adjoint_torch":
+        backend = "adjoint"
+        scan_backend = "torch"
+    elif backend == "deer_adjoint_accel_scan":
+        backend = "adjoint"
+        scan_backend = "accel_scan"
 
-        z_t = sigmoid(a_z * h_{t-1} + B_z x_t + b_z)
+    if backend not in ("autograd", "adjoint"):
+        raise ValueError(
+            f"Unknown ParaGRU backend {backend!r}. Expected 'autograd' or 'adjoint'."
+        )
 
-        r_t = sigmoid(a_r * h_{t-1} + B_r x_t + b_r)
+    return DeerNewtonConfig(
+        num_iters=num_iters,
+        tol=tol,
+        strict_tol=strict_tol,
+        stopping_criterion="update",
+        initial_guess=initial_guess,  # type: ignore[arg-type]
+        quasi=True,
+        scan_backend=scan_backend,
+        accel_module=accel_module,
+        jacobian_backend="explicit",
+        backward_backend=backend,
+    )
 
-        c_t = tanh(a_h * (h_{t-1} * r_t) + B_h x_t + b_h)
 
-        h_t = z_t * c_t + (1 - z_t) * h_{t-1}
+class ParaGRUCell(nn.Module):
+    """Single-step diagonal ParaGRU cell, analogous to torch.nn.GRUCell.
 
-    The recurrent matrices are diagonal. Therefore the Jacobian
+    Args:
+        input_size:
+            Number of input features.
+        hidden_size:
+            Number of hidden-state features.
+        bias:
+            If False, the gate bias parameters are fixed to zero and are not
+            trainable.
 
-        d h_t / d h_{t-1}
-
-    is diagonal and can be represented by a tensor of shape (..., state_dim).
+    Shapes:
+        input: (input_size,) or (batch, input_size)
+        hx: (hidden_size,) or (batch, hidden_size)
+        output: same hidden layout as hx.
     """
 
-    def __init__(self, config: ParaGRUConfig | ParaRNNConfig):
-        super().__init__(config)
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        bias: bool = True,
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+        recurrent_init_scale: float = 0.25,
+        input_init_scale: float = 1.0,
+        bias_init_value: float = 0.0,
+    ):
+        super().__init__()
 
-        if self.output_dim != self.state_dim:
-            raise ValueError(
-                "ParaGRUCell uses identity post_process, so output_dim must equal state_dim."
+        if input_size <= 0:
+            raise ValueError("input_size must be positive.")
+        if hidden_size <= 0:
+            raise ValueError("hidden_size must be positive.")
+
+        factory_kwargs = {"device": device, "dtype": dtype}
+
+        self.input_size = int(input_size)
+        self.hidden_size = int(hidden_size)
+        self.bias_enabled = bool(bias)
+        self.recurrent_init_scale = float(recurrent_init_scale)
+        self.input_init_scale = float(input_init_scale)
+        self.bias_init_value = float(bias_init_value)
+
+        self.A = nn.Parameter(torch.empty(3, hidden_size, **factory_kwargs))
+        self.B = nn.Parameter(torch.empty(
+            3, input_size, hidden_size, **factory_kwargs))
+
+        if self.bias_enabled:
+            self.b = nn.Parameter(torch.empty(
+                3, hidden_size, **factory_kwargs))
+        else:
+            self.register_buffer(
+                "b",
+                torch.zeros(3, hidden_size, **factory_kwargs),
             )
-
-        self.A = torch.nn.Parameter(torch.empty(3, self.state_dim))
-        self.B = torch.nn.Parameter(torch.empty(
-            3, self.input_dim, self.state_dim))
-        self.b = torch.nn.Parameter(torch.empty(3, self.state_dim))
 
         self.reset_parameters()
 
-        if config.device is not None or config.dtype is not None:
-            self.to(device=config.device, dtype=config.dtype)
-
     def reset_parameters(self) -> None:
-        recurrent_init_scale = float(
-            getattr(self.config, "recurrent_init_scale", 0.25)
-        )
-        bias_init_value = float(
-            getattr(self.config, "bias_init_value", 0.0)
-        )
-
         torch.nn.init.uniform_(
             self.A,
-            a=-recurrent_init_scale,
-            b=recurrent_init_scale,
+            a=-self.recurrent_init_scale,
+            b=self.recurrent_init_scale,
         )
 
         for gate_idx in range(3):
             torch.nn.init.xavier_uniform_(self.B[gate_idx])
+            if self.input_init_scale != 1.0:
+                with torch.no_grad():
+                    self.B[gate_idx].mul_(self.input_init_scale)
 
-        torch.nn.init.constant_(self.b, bias_init_value)
+        if self.bias_enabled:
+            torch.nn.init.constant_(self.b, self.bias_init_value)
+
+    def extra_repr(self) -> str:
+        return (
+            f"input_size={self.input_size}, hidden_size={self.hidden_size}, "
+            f"bias={self.bias_enabled}"
+        )
+
+    def forward(
+        self,
+        input: torch.Tensor,
+        hx: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        unbatched = input.ndim == 1
+
+        if input.ndim not in (1, 2):
+            raise ValueError(
+                "ParaGRUCell input must have shape (input_size,) or "
+                f"(batch, input_size), got {tuple(input.shape)}."
+            )
+
+        if input.shape[-1] != self.input_size:
+            raise ValueError(
+                f"Expected input.shape[-1] == {self.input_size}, got {input.shape[-1]}."
+            )
+
+        input_batched = input.unsqueeze(0) if unbatched else input
+
+        if hx is None:
+            hx_batched = torch.zeros(
+                input_batched.shape[0],
+                self.hidden_size,
+                device=input.device,
+                dtype=input.dtype,
+            )
+        else:
+            if hx.ndim == 1:
+                hx_batched = hx.unsqueeze(0)
+            elif hx.ndim == 2:
+                hx_batched = hx
+            else:
+                raise ValueError(
+                    "ParaGRUCell hx must have shape (hidden_size,) or "
+                    f"(batch, hidden_size), got {tuple(hx.shape)}."
+                )
+
+            expected = (input_batched.shape[0], self.hidden_size)
+            if tuple(hx_batched.shape) != expected:
+                raise ValueError(
+                    f"Expected hx shape {expected}, got {tuple(hx_batched.shape)}."
+                )
+
+            hx_batched = hx_batched.to(device=input.device, dtype=input.dtype)
+
+        out = self.recurrence_step(hx_batched, input_batched)
+
+        if unbatched:
+            return out.squeeze(0)
+        return out
 
     def recurrence_step(
         self,
         state: torch.Tensor,
         driver: torch.Tensor,
     ) -> torch.Tensor:
-        """One ParaGRU recurrent update.
+        """One ParaGRU recurrent update with argument order (state, input)."""
+        return functional_paragru_recurrence_step(
+            state=state,
+            driver=driver,
+            A=self.A,
+            B=self.B,
+            b=self.b,
+        )
+
+    def input_projection(self, driver: torch.Tensor) -> torch.Tensor:
+        return functional_paragru_input_projection(driver, self.B, self.b)
+
+    def compute_linearization_diag_from_previous(
+        self,
+        previous_states: torch.Tensor,
+        drivers: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return functional_paragru_linearization_diag_from_previous(
+            previous_states=previous_states,
+            drivers=drivers,
+            A=self.A,
+            B=self.B,
+            b=self.b,
+        )
+
+    def _compute_jacobians_diag_from_previous(
+        self,
+        previous_states: torch.Tensor,
+        drivers: torch.Tensor,
+    ) -> torch.Tensor:
+        _, jacobian_diag = self.compute_linearization_diag_from_previous(
+            previous_states=previous_states,
+            drivers=drivers,
+        )
+        return jacobian_diag
+
+
+class ParaGRU(BaseParaRNNCell):
+    """Sequence-level diagonal ParaGRU, analogous to torch.nn.GRU.
+
+    Public call:
+
+        output, h_n = rnn(input, hx=None)
+
+    Current implementation scope:
+        * one recurrent layer,
+        * one direction,
+        * diagonal recurrent ParaGRU dynamics,
+        * sequential or DEER forward modes,
+        * optional custom adjoint backward for explicit quasi-DEER.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        num_layers: int = 1,
+        bias: bool = True,
+        batch_first: bool = False,
+        dropout: float = 0.0,
+        bidirectional: bool = False,
+        *,
+        mode: Literal["sequential", "deer"] = "deer",
+        deer_config: DeerNewtonConfig | None = None,
+        backend: ParaGRUBackend = "adjoint",
+        scan_backend: Literal["torch", "accel_scan"] = "torch",
+        num_iters: int = 4,
+        tol: float | None = None,
+        strict_tol: bool = False,
+        accel_module: str = "warp",
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+        recurrent_init_scale: float = 0.25,
+        input_init_scale: float = 1.0,
+        bias_init_value: float = 0.0,
+    ):
+        if num_layers != 1:
+            raise NotImplementedError(
+                "ParaGRU currently supports num_layers=1 only.")
+        if bidirectional:
+            raise NotImplementedError(
+                "ParaGRU currently supports bidirectional=False only.")
+        if dropout != 0.0:
+            raise NotImplementedError(
+                "ParaGRU currently supports dropout=0.0 only.")
+
+        if deer_config is None:
+            deer_config = make_paragru_deer_config(
+                backend=backend,
+                num_iters=num_iters,
+                tol=tol,
+                strict_tol=strict_tol,
+                scan_backend=scan_backend,
+                accel_module=accel_module,
+            )
+
+        config = ParaGRUConfig(
+            input_dim=input_size,
+            state_dim=hidden_size,
+            output_dim=hidden_size,
+            mode=mode,
+            batch_first=batch_first,
+            device=torch.device(device) if device is not None else None,
+            dtype=dtype,
+            deer=deer_config,
+            recurrent_init_scale=recurrent_init_scale,
+            input_init_scale=input_init_scale,
+            bias_init_value=bias_init_value,
+            bias=bias,
+        )
+
+        super().__init__(config)
+
+        self.input_size = int(input_size)
+        self.hidden_size = int(hidden_size)
+        self.num_layers = int(num_layers)
+        self.bias = bool(bias)
+        self.dropout = float(dropout)
+        self.bidirectional = bool(bidirectional)
+
+        self.cell = ParaGRUCell(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            bias=bias,
+            device=device,
+            dtype=dtype,
+            recurrent_init_scale=recurrent_init_scale,
+            input_init_scale=input_init_scale,
+            bias_init_value=bias_init_value,
+        )
+
+    def extra_repr(self) -> str:
+        return (
+            f"input_size={self.input_size}, hidden_size={self.hidden_size}, "
+            f"num_layers={self.num_layers}, bias={self.bias}, "
+            f"batch_first={self.batch_first}, mode={self.mode}"
+        )
+
+    def recurrence_step(
+        self,
+        state: torch.Tensor,
+        driver: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.cell.recurrence_step(state, driver)
+
+    def reset_parameters(self) -> None:
+        self.cell.reset_parameters()
+
+    @property
+    def A(self) -> torch.nn.Parameter:
+        return self.cell.A
+
+    @property
+    def B(self) -> torch.nn.Parameter:
+        return self.cell.B
+
+    @property
+    def b(self) -> torch.Tensor:
+        return self.cell.b
+
+    def forward(
+        self,
+        input: torch.Tensor,
+        hx: torch.Tensor | None = None,
+        *,
+        mode: Literal["sequential", "deer"] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the ParaGRU over a full sequence.
 
         Args:
-            state:
-                Previous hidden state with shape (..., state_dim).
-
-            driver:
-                Input with shape (..., input_dim).
+            input:
+                (L, input_size) for unbatched input,
+                (L, N, input_size) when batch_first=False, or
+                (N, L, input_size) when batch_first=True.
+            hx:
+                Optional initial state with shape (1, H) for unbatched input, or
+                (1, N, H) for batched input. (H,) and (N, H) are also accepted
+                for convenience.
 
         Returns:
-            Next hidden state with shape (..., state_dim).
+            (output, h_n), following the PyTorch GRU convention.
         """
-        Bx_plus_b = self._input_projection(driver)
+        initial_state, unbatched_input = self._hx_to_initial_state(input, hx)
+        selected_mode = self.mode if mode is None else mode
 
-        z_pre = self.A[0] * state + Bx_plus_b[..., 0, :]
-        r_pre = self.A[1] * state + Bx_plus_b[..., 1, :]
+        if selected_mode == "sequential":
+            output = self.forward_sequential(
+                input, initial_state=initial_state)
+        elif selected_mode == "deer":
+            output = self.forward_deer(input, initial_state=initial_state)
+        else:
+            raise ValueError(
+                f"Unknown mode {selected_mode!r}. Expected 'sequential' or 'deer'."
+            )
 
-        z = torch.sigmoid(z_pre)
-        r = torch.sigmoid(r_pre)
+        h_n = self._make_h_n(output, unbatched_input=unbatched_input)
+        return output, h_n
 
-        c_pre = self.A[2] * (state * r) + Bx_plus_b[..., 2, :]
-        c = torch.tanh(c_pre)
+    def _hx_to_initial_state(
+        self,
+        input: torch.Tensor,
+        hx: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, bool]:
+        if input.ndim == 2:
+            unbatched = True
+            batch_size = 1
+        elif input.ndim == 3:
+            unbatched = False
+            batch_size = input.shape[0] if self.batch_first else input.shape[1]
+        else:
+            raise ValueError(
+                "ParaGRU input must have shape (L, input_size), "
+                "(L, N, input_size), or (N, L, input_size)."
+            )
 
-        next_state = z * c + (1.0 - z) * state
+        if hx is None:
+            return None, unbatched
 
-        return next_state
+        hx = hx.to(device=input.device, dtype=input.dtype)
+
+        if unbatched:
+            if hx.ndim == 1:
+                if hx.shape != (self.hidden_size,):
+                    raise ValueError(
+                        f"Expected hx shape ({self.hidden_size},), got {tuple(hx.shape)}."
+                    )
+                return hx, True
+            if hx.ndim == 2:
+                if hx.shape != (1, self.hidden_size):
+                    raise ValueError(
+                        f"Expected hx shape (1, {self.hidden_size}), got {tuple(hx.shape)}."
+                    )
+                return hx.squeeze(0), True
+            raise ValueError(
+                "For unbatched input, hx must have shape (hidden_size,) or "
+                "(1, hidden_size)."
+            )
+
+        if hx.ndim == 2:
+            expected = (batch_size, self.hidden_size)
+            if tuple(hx.shape) != expected:
+                raise ValueError(
+                    f"Expected hx shape {expected}, got {tuple(hx.shape)}.")
+            return hx, False
+
+        if hx.ndim == 3:
+            expected = (1, batch_size, self.hidden_size)
+            if tuple(hx.shape) != expected:
+                raise ValueError(
+                    f"Expected hx shape {expected}, got {tuple(hx.shape)}.")
+            return hx[0], False
+
+        raise ValueError(
+            "For batched input, hx must have shape (batch, hidden_size) or "
+            "(1, batch, hidden_size)."
+        )
+
+    def _make_h_n(
+        self,
+        output: torch.Tensor,
+        *,
+        unbatched_input: bool,
+    ) -> torch.Tensor:
+        if output.shape[-2] == 0:
+            raise ValueError("Cannot compute h_n for an empty sequence.")
+
+        if unbatched_input:
+            return output[-1, :].unsqueeze(0)
+
+        if self.batch_first:
+            return output[:, -1, :].unsqueeze(0)
+
+        return output[-1, :, :].unsqueeze(0)
+
+    def forward_deer(
+        self,
+        x: torch.Tensor,
+        initial_state: torch.Tensor | None = None,
+        deer_config: DeerNewtonConfig | None = None,
+    ) -> torch.Tensor:
+        cfg = self.config.deer if deer_config is None else deer_config
+
+        if getattr(cfg, "backward_backend", "autograd") != "adjoint":
+            return super().forward_deer(
+                x=x,
+                initial_state=initial_state,
+                deer_config=cfg,
+            )
+
+        self._validate_adjoint_deer_config(cfg)
+
+        x_batched, had_batch_dim = self._normalize_input(x)
+        initial_state_batched = self._normalize_initial_state(
+            x_batched=x_batched,
+            initial_state=initial_state,
+        )
+        accel_scan_fn = self._load_accel_scan_if_needed(cfg)
+
+        states = paragru_adjoint_deer_forward(
+            drivers=x_batched,
+            initial_state=initial_state_batched,
+            A=self.cell.A,
+            B=self.cell.B,
+            b=self.cell.b,
+            cfg=cfg,
+            accel_scan_fn=accel_scan_fn,
+        )
+
+        with torch.no_grad():
+            final_merit = merit_fxn_batched(
+                f=self.recurrence_step,
+                initial_state=initial_state_batched,
+                states=states.detach(),
+                drivers=x_batched,
+            )
+
+        self.last_deer_infos = [
+            {
+                "num_iters": cfg.num_iters,
+                "initial_merit": None,
+                "final_merit": final_merit.detach(),
+                "last_update_error": None,
+                "tol": cfg.tol,
+                "effective_tol": None,
+                "strict_tol": cfg.strict_tol,
+                "stopping_criterion": cfg.stopping_criterion,
+                "scan_backend": cfg.scan_backend,
+                "quasi": True,
+                "batched": True,
+                "batch_size": x_batched.shape[0],
+                "jacobian_backend": "custom",
+                "linearization_backend": "custom",
+                "backward_backend": "adjoint",
+            }
+        ]
+
+        outputs = self.post_process(states)
+
+        return self._restore_output_layout(
+            outputs,
+            had_batch_dim=had_batch_dim,
+        )
+
+    @staticmethod
+    def _validate_adjoint_deer_config(cfg: DeerNewtonConfig) -> None:
+        if not cfg.quasi:
+            raise ValueError(
+                "backward_backend='adjoint' currently requires quasi=True.")
+        if cfg.jacobian_backend != "explicit":
+            raise ValueError(
+                "backward_backend='adjoint' currently requires "
+                "jacobian_backend='explicit'."
+            )
+        if cfg.return_trace:
+            raise ValueError(
+                "backward_backend='adjoint' does not support return_trace=True.")
 
     def assemble_initial_guess(
         self,
@@ -125,18 +591,10 @@ class ParaGRUCell(BaseParaRNNCell):
         initial_state: torch.Tensor,
         guess_type: str = "f0",
     ) -> torch.Tensor:
-        """Assemble the Newton initial guess for one sequence.
-
-        For ``guess_type='f0'`` this computes
-
-            h_t^0 = f(0, x_t)
-
-        in vectorized form across time.
-        """
         if guess_type == "zero":
             return torch.zeros(
                 drivers.shape[0],
-                self.state_dim,
+                self.hidden_size,
                 device=drivers.device,
                 dtype=drivers.dtype,
             )
@@ -144,11 +602,10 @@ class ParaGRUCell(BaseParaRNNCell):
         if guess_type == "f0":
             zero_states = torch.zeros(
                 drivers.shape[0],
-                self.state_dim,
+                self.hidden_size,
                 device=drivers.device,
                 dtype=drivers.dtype,
             )
-
             return self.recurrence_step(zero_states, drivers)
 
         raise ValueError(f"Unknown initial guess type: {guess_type!r}.")
@@ -159,29 +616,16 @@ class ParaGRUCell(BaseParaRNNCell):
         drivers: torch.Tensor,
         initial_state: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Compute the explicit diagonal ParaGRU Jacobian.
-
-        Returns:
-            Tensor with shape (B, T, state_dim), representing the diagonal of
-
-                d f(h_{t-1}, x_t) / d h_{t-1}.
-
-        For an unbatched input, the returned tensor still uses the normalized
-        batched shape (1, T, state_dim). This matches the base class Jacobian
-        convention.
-        """
         x_batched, _ = self._normalize_input(drivers)
         state_batched, _ = self._normalize_states(states)
         initial_state_batched = self._normalize_initial_state(
             x_batched=x_batched,
             initial_state=initial_state,
         )
-
         previous_states = self.roll_state(
             states=state_batched,
             initial_state=initial_state_batched,
         )
-
         return self._compute_jacobians_diag_from_previous(
             previous_states=previous_states,
             drivers=x_batched,
@@ -193,143 +637,31 @@ class ParaGRUCell(BaseParaRNNCell):
         drivers: torch.Tensor,
         initial_state: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Compute diagonals for the reverse-time backward recurrence.
-
-        This prepares the same object used later for a ParaRNN-style custom
-        backward pass. For a diagonal Jacobian, transposition does not change
-        entries, but the recurrence must be flipped in time.
-        """
         jac = self.compute_jacobians_diag(
             states=states,
             drivers=drivers,
             initial_state=initial_state,
         )
-
-        jac_bwd = torch.roll(
-            torch.flip(jac, dims=[1]),
-            shifts=1,
-            dims=1,
-        )
-
+        jac_bwd = torch.roll(torch.flip(jac, dims=[1]), shifts=1, dims=1)
         jac_bwd[:, 0, :] = 0.0
-
         return jac_bwd
-
-    def _input_projection(self, driver: torch.Tensor) -> torch.Tensor:
-        """Compute all three input projections B_g x + b_g.
-
-        Args:
-            driver:
-                Tensor with shape (..., input_dim).
-
-        Returns:
-            Tensor with shape (..., 3, state_dim).
-        """
-        return torch.einsum("...i,gij->...gj", driver, self.B) + self.b
 
     def compute_linearization_diag_from_previous(
         self,
         previous_states: torch.Tensor,
         drivers: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute ParaGRU recurrence values and diagonal Jacobians together.
-
-        This is the fused linearization used by explicit quasi-DEER. It avoids
-        computing the ParaGRU gates once for ``f(h_{t-1}, x_t)`` and a second
-        time for ``diag(df/dh)``.
-
-        Args:
-            previous_states:
-                Tensor with shape ``(B, T, state_dim)``, containing
-                ``h_{t-1}``.
-
-            drivers:
-                Tensor with shape ``(B, T, input_dim)``, containing ``x_t``.
-
-        Returns:
-            predicted_states:
-                Tensor with shape ``(B, T, state_dim)``, containing
-                ``f(h_{t-1}, x_t)``.
-
-            jacobian_diag:
-                Tensor with shape ``(B, T, state_dim)``, containing the diagonal
-                entries of ``df(h_{t-1}, x_t) / dh_{t-1}``.
-        """
-        if previous_states.ndim != 3:
-            raise ValueError(
-                "previous_states must have shape (B, T, state_dim), "
-                f"got {tuple(previous_states.shape)}."
-            )
-
-        if drivers.ndim != 3:
-            raise ValueError(
-                "drivers must have shape (B, T, input_dim), "
-                f"got {tuple(drivers.shape)}."
-            )
-
-        if previous_states.shape[:2] != drivers.shape[:2]:
-            raise ValueError(
-                "previous_states and drivers must share batch/time dimensions, "
-                f"got {tuple(previous_states.shape)} and {tuple(drivers.shape)}."
-            )
-
-        h_prev = previous_states
-
-        Bx_plus_b = self._input_projection(drivers)
-
-        z_pre = self.A[0] * h_prev + Bx_plus_b[..., 0, :]
-        r_pre = self.A[1] * h_prev + Bx_plus_b[..., 1, :]
-
-        z = torch.sigmoid(z_pre)
-        r = torch.sigmoid(r_pre)
-
-        c_pre = self.A[2] * (h_prev * r) + Bx_plus_b[..., 2, :]
-        c = torch.tanh(c_pre)
-
-        predicted_states = z * c + (1.0 - z) * h_prev
-
-        dz_dpre = z * (1.0 - z)
-        dr_dpre = r * (1.0 - r)
-        dc_dpre = 1.0 - c * c
-
-        dz_dh = self.A[0] * dz_dpre
-        dr_dh = self.A[1] * dr_dpre
-
-        dcpre_dh = self.A[2] * (r + h_prev * dr_dh)
-        dc_dh = dc_dpre * dcpre_dh
-
-        jacobian_diag = (
-            (1.0 - z)
-            + (c - h_prev) * dz_dh
-            + z * dc_dh
+        return self.cell.compute_linearization_diag_from_previous(
+            previous_states=previous_states,
+            drivers=drivers,
         )
-
-        return predicted_states, jacobian_diag
 
     def _compute_jacobians_diag_from_previous(
         self,
         previous_states: torch.Tensor,
         drivers: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute explicit diagonal Jacobians from previous states.
-
-        Args:
-            previous_states:
-                Tensor with shape (B, T, state_dim), containing h_{t-1}.
-
-            drivers:
-                Tensor with shape (B, T, input_dim), containing x_t.
-
-        Returns:
-            Tensor with shape (B, T, state_dim).
-        """
-        _, jacobian_diag = self.compute_linearization_diag_from_previous(
+        return self.cell._compute_jacobians_diag_from_previous(
             previous_states=previous_states,
             drivers=drivers,
         )
-
-        return jacobian_diag
-
-
-# Shorter alias for convenience.
-ParaGRU = ParaGRUCell
