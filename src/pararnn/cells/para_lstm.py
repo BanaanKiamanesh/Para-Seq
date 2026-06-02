@@ -16,14 +16,15 @@ ParaLSTMBackend = Literal["autograd", "block_deer_autograd_torch"]
 
 @dataclass
 class ParaLSTMConfig(ParaRNNConfig):
-    """Internal config for ParaLSTM.
+    """Internal config for the paper-faithful ParaLSTM-CIFG cell.
 
-    The internal state is concat(c, h), so state_dim = 2 * hidden_size.
-    The user-facing output is h, so output_dim = hidden_size.
+    Internal state is concat(c, h), so state_dim = 2 * hidden_size.
+    User-facing output is h, so output_dim = hidden_size.
     """
 
     hidden_size: int = 0
     recurrent_init_scale: float = 0.25
+    peephole_init_scale: float = 0.25
     input_init_scale: float = 1.0
     bias_init_value: float = 0.0
     forget_bias_init_value: float = 1.0
@@ -39,11 +40,6 @@ def make_paralstm_deer_config(
     initial_guess: str = "f0",
     scan_backend: Literal["torch"] = "torch",
 ) -> DeerNewtonConfig:
-    """Construct a block-DEER config for ParaLSTM.
-
-    LSTM has state (c_t, h_t). Therefore each hidden coordinate has a 2D state,
-    and the structured Jacobian is block diagonal with 2x2 blocks.
-    """
     if backend == "block_deer_autograd_torch":
         backend = "autograd"
 
@@ -57,7 +53,11 @@ def make_paralstm_deer_config(
             "ParaLSTM block-DEER currently supports scan_backend='torch' only."
         )
 
-    return DeerNewtonConfig(
+    # Some older local snapshots of this project do not yet define
+    # jacobian_backend/backward_backend as dataclass fields. Dataclasses are not
+    # slotted here, so we attach these attributes after construction for
+    # compatibility.
+    cfg = DeerNewtonConfig(
         num_iters=num_iters,
         tol=tol,
         strict_tol=strict_tol,
@@ -66,9 +66,10 @@ def make_paralstm_deer_config(
         quasi=True,
         scan_backend="torch",
         accel_module="warp",
-        jacobian_backend="explicit",
-        backward_backend="autograd",
     )
+    cfg.jacobian_backend = "explicit"
+    cfg.backward_backend = "autograd"
+    return cfg
 
 
 def functional_paralstm_input_projection(
@@ -76,6 +77,13 @@ def functional_paralstm_input_projection(
     B: torch.Tensor,
     b: torch.Tensor,
 ) -> torch.Tensor:
+    """Compute B_* x + b_* for gates f, z, o.
+
+    Gate order is:
+        0 -> forget gate f
+        1 -> candidate/update z
+        2 -> output gate o
+    """
     return torch.einsum("...i,gij->...gj", driver, B) + b
 
 
@@ -114,32 +122,36 @@ def functional_paralstm_recurrence_step(
     driver: torch.Tensor,
     A: torch.Tensor,
     B: torch.Tensor,
+    C: torch.Tensor,
     b: torch.Tensor,
 ) -> torch.Tensor:
-    """Functional diagonal-recurrent LSTM step.
+    """Paper-faithful CIFG peephole diagonal ParaLSTM recurrence.
 
-    Internal state:
+    Equations:
+        f_t = sigmoid(A_f h_{t-1} + B_f x_t + C_f c_{t-1} + b_f)
+        z_t = tanh(   A_z h_{t-1} + B_z x_t                         + b_z)
+        c_t = f_t * c_{t-1} + (1 - f_t) * z_t
+        o_t = sigmoid(A_o h_{t-1} + B_o x_t + C_o c_t     + b_o)
+        h_t = o_t * tanh(c_t)
 
-        state = concat(c, h)
-
-    Recurrent parameters A are diagonal and act on h_prev.
+    Internal state is concat(c_t, h_t).
     """
     hidden_size = A.shape[1]
     c_prev, h_prev = _split_flat_state(state, hidden_size)
 
     Bx_plus_b = functional_paralstm_input_projection(driver, B, b)
 
-    i_pre = A[0] * h_prev + Bx_plus_b[..., 0, :]
-    f_pre = A[1] * h_prev + Bx_plus_b[..., 1, :]
-    g_pre = A[2] * h_prev + Bx_plus_b[..., 2, :]
-    o_pre = A[3] * h_prev + Bx_plus_b[..., 3, :]
+    f_pre = A[0] * h_prev + Bx_plus_b[..., 0, :] + C[0] * c_prev
+    z_pre = A[1] * h_prev + Bx_plus_b[..., 1, :]
 
-    i = torch.sigmoid(i_pre)
     f = torch.sigmoid(f_pre)
-    g = torch.tanh(g_pre)
+    z = torch.tanh(z_pre)
+
+    c_next = f * c_prev + (1.0 - f) * z
+
+    o_pre = A[2] * h_prev + Bx_plus_b[..., 2, :] + C[1] * c_next
     o = torch.sigmoid(o_pre)
 
-    c_next = f * c_prev + i * g
     h_next = o * torch.tanh(c_next)
 
     return _pack_flat_state(c_next, h_next)
@@ -150,17 +162,17 @@ def functional_paralstm_linearization_blocks_from_previous(
     drivers: torch.Tensor,
     A: torch.Tensor,
     B: torch.Tensor,
+    C: torch.Tensor,
     b: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return predicted block states and exact 2x2 block Jacobians.
 
-    Args:
-        previous_states: (B, T, H, 2), final dimension is (c_prev, h_prev)
-        drivers: (B, T, input_size)
+    previous_states has shape (B, T, H, 2), with final dimension (c_prev, h_prev).
+    drivers has shape (B, T, input_size).
 
     Returns:
-        predicted_states: (B, T, H, 2)
-        jacobian_blocks: (B, T, H, 2, 2)
+        predicted_states: (B, T, H, 2), final dimension (c_next, h_next)
+        jacobian_blocks:  (B, T, H, 2, 2), block Jacobian d(c,h)_t/d(c,h)_{t-1}
     """
     if previous_states.ndim != 4 or previous_states.shape[-1] != 2:
         raise ValueError(
@@ -185,30 +197,39 @@ def functional_paralstm_linearization_blocks_from_previous(
 
     Bx_plus_b = functional_paralstm_input_projection(drivers, B, b)
 
-    i_pre = A[0] * h_prev + Bx_plus_b[..., 0, :]
-    f_pre = A[1] * h_prev + Bx_plus_b[..., 1, :]
-    g_pre = A[2] * h_prev + Bx_plus_b[..., 2, :]
-    o_pre = A[3] * h_prev + Bx_plus_b[..., 3, :]
+    f_pre = A[0] * h_prev + Bx_plus_b[..., 0, :] + C[0] * c_prev
+    z_pre = A[1] * h_prev + Bx_plus_b[..., 1, :]
 
-    i = torch.sigmoid(i_pre)
     f = torch.sigmoid(f_pre)
-    g = torch.tanh(g_pre)
+    z = torch.tanh(z_pre)
+
+    c_next = f * c_prev + (1.0 - f) * z
+
+    o_pre = A[2] * h_prev + Bx_plus_b[..., 2, :] + C[1] * c_next
     o = torch.sigmoid(o_pre)
 
-    c_next = f * c_prev + i * g
     tanh_c = torch.tanh(c_next)
     h_next = o * tanh_c
 
-    di_dh = A[0] * i * (1.0 - i)
-    df_dh = A[1] * f * (1.0 - f)
-    dg_dh = A[2] * (1.0 - g * g)
-    do_dh = A[3] * o * (1.0 - o)
+    df_dpre = f * (1.0 - f)
+    dz_dpre = 1.0 - z * z
+    do_dpre = o * (1.0 - o)
+    dtanhc_dc = 1.0 - tanh_c * tanh_c
 
-    dc_dc = f
-    dc_dh = c_prev * df_dh + g * di_dh + i * dg_dh
+    df_dc_prev = C[0] * df_dpre
+    df_dh_prev = A[0] * df_dpre
+    dz_dh_prev = A[1] * dz_dpre
 
-    dh_dc = o * (1.0 - tanh_c * tanh_c) * dc_dc
-    dh_dh = do_dh * tanh_c + o * (1.0 - tanh_c * tanh_c) * dc_dh
+    # c_t = z_t + f_t * (c_{t-1} - z_t)
+    dc_dc = f + (c_prev - z) * df_dc_prev
+    dc_dh = (c_prev - z) * df_dh_prev + (1.0 - f) * dz_dh_prev
+
+    # o_pre = A_o h_{t-1} + B_o x_t + C_o c_t + b_o
+    do_dc = do_dpre * (C[1] * dc_dc)
+    do_dh = do_dpre * (A[2] + C[1] * dc_dh)
+
+    dh_dc = do_dc * tanh_c + o * dtanhc_dc * dc_dc
+    dh_dh = do_dh * tanh_c + o * dtanhc_dc * dc_dh
 
     predicted_states = torch.stack([c_next, h_next], dim=-1)
 
@@ -244,7 +265,14 @@ def _effective_tol(
 
 
 class ParaLSTMCell(nn.Module):
-    """Single-step diagonal ParaLSTM cell, analogous to torch.nn.LSTMCell."""
+    """Single-step CIFG peephole diagonal ParaLSTM cell.
+
+    This is intentionally PyTorch-like at the API level:
+        h_next, c_next = cell(x_t, (h_prev, c_prev))
+
+    Internally, however, the recurrence is the ParaRNN paper's simplified
+    CIFG peephole LSTM, not torch.nn.LSTMCell's four-gate dense LSTM.
+    """
 
     def __init__(
         self,
@@ -255,6 +283,7 @@ class ParaLSTMCell(nn.Module):
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
         recurrent_init_scale: float = 0.25,
+        peephole_init_scale: float = 0.25,
         input_init_scale: float = 1.0,
         bias_init_value: float = 0.0,
         forget_bias_init_value: float = 1.0,
@@ -272,21 +301,22 @@ class ParaLSTMCell(nn.Module):
         self.hidden_size = int(hidden_size)
         self.bias_enabled = bool(bias)
         self.recurrent_init_scale = float(recurrent_init_scale)
+        self.peephole_init_scale = float(peephole_init_scale)
         self.input_init_scale = float(input_init_scale)
         self.bias_init_value = float(bias_init_value)
         self.forget_bias_init_value = float(forget_bias_init_value)
 
-        self.A = nn.Parameter(torch.empty(4, hidden_size, **factory_kwargs))
-        self.B = nn.Parameter(
-            torch.empty(4, input_size, hidden_size, **factory_kwargs)
-        )
+        # Gate order: f, z/candidate, o.
+        self.A = nn.Parameter(torch.empty(3, hidden_size, **factory_kwargs))
+        self.B = nn.Parameter(torch.empty(3, input_size, hidden_size, **factory_kwargs))
+        self.C = nn.Parameter(torch.empty(2, hidden_size, **factory_kwargs))
 
         if self.bias_enabled:
-            self.b = nn.Parameter(torch.empty(4, hidden_size, **factory_kwargs))
+            self.b = nn.Parameter(torch.empty(3, hidden_size, **factory_kwargs))
         else:
             self.register_buffer(
                 "b",
-                torch.zeros(4, hidden_size, **factory_kwargs),
+                torch.zeros(3, hidden_size, **factory_kwargs),
             )
 
         self.reset_parameters()
@@ -297,8 +327,13 @@ class ParaLSTMCell(nn.Module):
             a=-self.recurrent_init_scale,
             b=self.recurrent_init_scale,
         )
+        torch.nn.init.uniform_(
+            self.C,
+            a=-self.peephole_init_scale,
+            b=self.peephole_init_scale,
+        )
 
-        for gate_idx in range(4):
+        for gate_idx in range(3):
             torch.nn.init.xavier_uniform_(self.B[gate_idx])
             if self.input_init_scale != 1.0:
                 with torch.no_grad():
@@ -307,12 +342,12 @@ class ParaLSTMCell(nn.Module):
         if self.bias_enabled:
             torch.nn.init.constant_(self.b, self.bias_init_value)
             with torch.no_grad():
-                self.b[1].fill_(self.forget_bias_init_value)
+                self.b[0].fill_(self.forget_bias_init_value)
 
     def extra_repr(self) -> str:
         return (
             f"input_size={self.input_size}, hidden_size={self.hidden_size}, "
-            f"bias={self.bias_enabled}"
+            f"bias={self.bias_enabled}, variant='cifg_peephole_diag'"
         )
 
     def forward(
@@ -392,6 +427,7 @@ class ParaLSTMCell(nn.Module):
             driver=driver,
             A=self.A,
             B=self.B,
+            C=self.C,
             b=self.b,
         )
 
@@ -408,12 +444,24 @@ class ParaLSTMCell(nn.Module):
             drivers=drivers,
             A=self.A,
             B=self.B,
+            C=self.C,
             b=self.b,
         )
 
 
 class ParaLSTM(BaseParaRNNCell):
-    """Sequence-level diagonal ParaLSTM, analogous to torch.nn.LSTM."""
+    """Sequence-level paper-faithful ParaLSTM, analogous to torch.nn.LSTM.
+
+    Public call:
+        output, (h_n, c_n) = lstm(input, hx=None)
+
+    Current implementation scope:
+        * one recurrent layer,
+        * one direction,
+        * diagonal CIFG peephole ParaLSTM dynamics,
+        * sequential or block-DEER forward modes,
+        * pure PyTorch 2x2 block associative scan.
+    """
 
     def __init__(
         self,
@@ -435,6 +483,7 @@ class ParaLSTM(BaseParaRNNCell):
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
         recurrent_init_scale: float = 0.25,
+        peephole_init_scale: float = 0.25,
         input_init_scale: float = 1.0,
         bias_init_value: float = 0.0,
         forget_bias_init_value: float = 1.0,
@@ -470,6 +519,7 @@ class ParaLSTM(BaseParaRNNCell):
             deer=deer_config,
             hidden_size=hidden_size,
             recurrent_init_scale=recurrent_init_scale,
+            peephole_init_scale=peephole_init_scale,
             input_init_scale=input_init_scale,
             bias_init_value=bias_init_value,
             forget_bias_init_value=forget_bias_init_value,
@@ -492,6 +542,7 @@ class ParaLSTM(BaseParaRNNCell):
             device=device,
             dtype=dtype,
             recurrent_init_scale=recurrent_init_scale,
+            peephole_init_scale=peephole_init_scale,
             input_init_scale=input_init_scale,
             bias_init_value=bias_init_value,
             forget_bias_init_value=forget_bias_init_value,
@@ -501,7 +552,8 @@ class ParaLSTM(BaseParaRNNCell):
         return (
             f"input_size={self.input_size}, hidden_size={self.hidden_size}, "
             f"num_layers={self.num_layers}, bias={self.bias}, "
-            f"batch_first={self.batch_first}, mode={self.mode}"
+            f"batch_first={self.batch_first}, mode={self.mode}, "
+            "variant='cifg_peephole_diag'"
         )
 
     @property
@@ -511,6 +563,10 @@ class ParaLSTM(BaseParaRNNCell):
     @property
     def B(self) -> torch.nn.Parameter:
         return self.cell.B
+
+    @property
+    def C(self) -> torch.nn.Parameter:
+        return self.cell.C
 
     @property
     def b(self) -> torch.Tensor:
@@ -744,11 +800,12 @@ class ParaLSTM(BaseParaRNNCell):
             strict_tol=cfg.strict_tol,
         )
 
-        initial_merit = self._block_deer_merit(
-            initial_blocks=initial_blocks,
-            states=states,
-            drivers=x_batched,
-        )
+        with torch.no_grad():
+            initial_merit = self._block_deer_merit(
+                initial_blocks=initial_blocks.detach(),
+                states=states.detach(),
+                drivers=x_batched.detach(),
+            )
 
         last_update_error = torch.tensor(
             float("inf"),
@@ -798,7 +855,11 @@ class ParaLSTM(BaseParaRNNCell):
                 states = torch.clamp(states, -cfg.clip_value, cfg.clip_value)
                 states = torch.nan_to_num(states)
 
-            last_update_error = torch.max(torch.abs(states - old_states))
+            with torch.no_grad():
+                last_update_error = torch.max(
+                    torch.abs(states.detach() - old_states.detach())
+                )
+
             num_steps_done = iter_idx + 1
 
             if (
@@ -808,19 +869,21 @@ class ParaLSTM(BaseParaRNNCell):
                 break
 
             if cfg.stopping_criterion == "merit":
-                current_merit = self._block_deer_merit(
-                    initial_blocks=initial_blocks,
-                    states=states,
-                    drivers=x_batched,
-                )
+                with torch.no_grad():
+                    current_merit = self._block_deer_merit(
+                        initial_blocks=initial_blocks.detach(),
+                        states=states.detach(),
+                        drivers=x_batched.detach(),
+                    )
                 if current_merit.item() <= effective_tol:
                     break
 
-        final_merit = self._block_deer_merit(
-            initial_blocks=initial_blocks,
-            states=states,
-            drivers=x_batched,
-        )
+        with torch.no_grad():
+            final_merit = self._block_deer_merit(
+                initial_blocks=initial_blocks.detach(),
+                states=states.detach(),
+                drivers=x_batched.detach(),
+            )
 
         self.last_deer_infos = [
             {
@@ -839,6 +902,7 @@ class ParaLSTM(BaseParaRNNCell):
                 "jacobian_backend": "explicit_block2",
                 "linearization_backend": "custom_block2",
                 "backward_backend": "autograd",
+                "cell_variant": "cifg_peephole_diag",
             }
         ]
 
@@ -869,11 +933,11 @@ class ParaLSTM(BaseParaRNNCell):
             raise ValueError(
                 "ParaLSTM block-DEER currently supports scan_backend='torch' only."
             )
-        if cfg.jacobian_backend != "explicit":
+        if getattr(cfg, "jacobian_backend", "explicit") != "explicit":
             raise ValueError(
                 "ParaLSTM block-DEER requires jacobian_backend='explicit'."
             )
-        if cfg.backward_backend != "autograd":
+        if getattr(cfg, "backward_backend", "autograd") != "autograd":
             raise ValueError(
                 "ParaLSTM block-DEER currently supports "
                 "backward_backend='autograd' only."
@@ -884,3 +948,4 @@ class ParaLSTM(BaseParaRNNCell):
             )
         if cfg.stopping_criterion not in ("update", "merit"):
             raise ValueError("stopping_criterion must be 'update' or 'merit'.")
+
