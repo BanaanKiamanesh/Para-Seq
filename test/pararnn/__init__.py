@@ -1,6 +1,13 @@
 from src.pararnn.config import DeerNewtonConfig, ParaRNNConfig, ParaRNNDeerConfig
 from src.pararnn.base_cell import BaseParaRNNCell, BaseDeerRNNCell
 from src.pararnn.cells.tanh_deer_cell import TanhDeerRNNCell
+from src.pararnn.cells.para_rnn import (
+    ParaRNN,
+    ParaRNNCell,
+    ParaRNNBackend,
+    ParaRNNNonlinearity,
+    make_pararnn_deer_config,
+)
 from src.pararnn.cells.para_gru import (
     ParaGRU,
     ParaGRUCell,
@@ -8,13 +15,20 @@ from src.pararnn.cells.para_gru import (
     ParaGRUBackend,
     make_paragru_deer_config,
 )
-from src.pararnn.cells.para_lstm import (
-    ParaLSTM,
-    ParaLSTMCell,
-    ParaLSTMConfig,
-    ParaLSTMBackend,
-    make_paralstm_deer_config,
-)
+try:
+    from src.pararnn.cells.para_lstm import (
+        ParaLSTM,
+        ParaLSTMCell,
+        ParaLSTMConfig,
+        ParaLSTMBackend,
+        make_paralstm_deer_config,
+    )
+except ImportError:  # compatibility with snapshots before ParaLSTM exists
+    ParaLSTM = None  # type: ignore
+    ParaLSTMCell = None  # type: ignore
+    ParaLSTMConfig = None  # type: ignore
+    ParaLSTMBackend = str  # type: ignore
+    make_paralstm_deer_config = None  # type: ignore
 
 __all__ = [
     "DeerNewtonConfig",
@@ -23,6 +37,11 @@ __all__ = [
     "BaseParaRNNCell",
     "BaseDeerRNNCell",
     "TanhDeerRNNCell",
+    "ParaRNN",
+    "ParaRNNCell",
+    "ParaRNNBackend",
+    "ParaRNNNonlinearity",
+    "make_pararnn_deer_config",
     "ParaGRU",
     "ParaGRUCell",
     "ParaGRUConfig",

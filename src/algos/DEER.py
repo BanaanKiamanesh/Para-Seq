@@ -139,12 +139,32 @@ def _validate_linearization_shapes(predicted, jacobian, previous_states, drivers
             f"{tuple(predicted.shape)} and previous_states={tuple(previous_states.shape)}."
         )
 
-    if jacobian.shape[:-1] != previous_states.shape[:-1]:
-        raise ValueError(
-            "linearization_fn returned a Jacobian with incompatible batch/time "
-            f"shape {tuple(jacobian.shape)} for previous_states "
-            f"{tuple(previous_states.shape)} and drivers {tuple(drivers.shape)}."
-        )
+    # Two valid cases:
+    #
+    # 1. Diagonal/quasi-DEER Jacobian:
+    #       previous_states: (B, T, D)
+    #       jacobian:        (B, T, D)
+    #
+    # 2. Full/dense-DEER Jacobian:
+    #       previous_states: (B, T, D)
+    #       jacobian:        (B, T, D, D)
+    #
+    # The dense vanilla ParaRNN uses case 2.
+    expected_diag = tuple(previous_states.shape)
+    expected_dense = expected_diag + (previous_states.shape[-1],)
+
+    if tuple(jacobian.shape) == expected_diag:
+        return
+
+    if tuple(jacobian.shape) == expected_dense:
+        return
+
+    raise ValueError(
+        "linearization_fn returned a Jacobian with incompatible shape. "
+        f"Expected diagonal shape {expected_diag} or dense shape {expected_dense}. "
+        f"Got jacobian={tuple(jacobian.shape)} for previous_states "
+        f"{tuple(previous_states.shape)} and drivers {tuple(drivers.shape)}."
+    )
 
 
 def deer_step(
