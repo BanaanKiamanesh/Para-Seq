@@ -8,6 +8,13 @@ from src.pararnn.cells.para_gru import (
     ParaGRUBackend,
     make_paragru_deer_config,
 )
+from src.pararnn.cells.para_lstm import (
+    ParaLSTM,
+    ParaLSTMCell,
+    ParaLSTMConfig,
+    ParaLSTMBackend,
+    make_paralstm_deer_config,
+)
 
 __all__ = [
     "DeerNewtonConfig",
@@ -21,4 +28,9 @@ __all__ = [
     "ParaGRUConfig",
     "ParaGRUBackend",
     "make_paragru_deer_config",
+    "ParaLSTM",
+    "ParaLSTMCell",
+    "ParaLSTMConfig",
+    "ParaLSTMBackend",
+    "make_paralstm_deer_config",
 ]
