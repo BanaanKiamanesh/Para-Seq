@@ -8,7 +8,6 @@ venv/
 
 .DS_Store
 
-notebooks/
 notebooks/data/
 
 test/bench/logs/*.csv
