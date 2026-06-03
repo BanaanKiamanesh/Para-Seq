@@ -1244,3 +1244,204 @@ except Exception:
     pass
 
 # === End ParaLSTM scalar quasi-DEER extension ===
+
+
+# === ParaLSTM block-2 custom adjoint extension ===
+
+from src.pararnn.adjoint import paralstm_block_adjoint_deer_forward
+
+
+def make_paralstm_deer_config(
+    backend: str = "autograd",
+    *,
+    num_iters: int = 4,
+    tol: float | None = None,
+    strict_tol: bool = False,
+    initial_guess: str = "f0",
+    scan_backend: str = "torch",
+    accel_module: str = "warp",
+) -> DeerNewtonConfig:
+    """Construct a DEER config for ParaLSTM.
+
+    Backends:
+        autograd / block_deer_autograd_torch:
+            exact 2x2 block-DEER with autograd through DEER iterations.
+
+        adjoint / block_deer_adjoint_torch:
+            exact 2x2 block-DEER forward with explicit reverse block adjoint.
+
+        quasi / quasi_autograd / quasi_deer_autograd_torch:
+            approximate scalar quasi-DEER with torch diagonal scan.
+
+        quasi_deer_autograd_accel_scan:
+            approximate scalar quasi-DEER with accelerated_scan.
+    """
+    if backend == "block_deer_autograd_torch":
+        backend = "autograd"
+        scan_backend = "torch"
+
+    if backend == "block_deer_adjoint_torch":
+        backend = "adjoint"
+        scan_backend = "torch"
+
+    if backend == "quasi":
+        backend = "quasi_autograd"
+
+    if backend == "quasi_deer_autograd_torch":
+        backend = "quasi_autograd"
+        scan_backend = "torch"
+
+    if backend == "quasi_deer_autograd_accel_scan":
+        backend = "quasi_autograd"
+        scan_backend = "accel_scan"
+
+    if backend in ("autograd", "adjoint"):
+        if scan_backend != "torch":
+            raise ValueError(
+                "ParaLSTM exact block-DEER supports scan_backend='torch' only. "
+                "Use backend='quasi_autograd' for scan_backend='accel_scan'."
+            )
+
+        cfg = DeerNewtonConfig(
+            num_iters=num_iters,
+            tol=tol,
+            strict_tol=strict_tol,
+            stopping_criterion="update",
+            initial_guess=initial_guess,  # type: ignore[arg-type]
+            quasi=True,
+            scan_backend="torch",
+            accel_module=accel_module,
+        )
+        cfg.jacobian_backend = "explicit"
+        cfg.backward_backend = backend
+        cfg.paralstm_deer_kind = "block2"
+        return cfg
+
+    if backend == "quasi_autograd":
+        if scan_backend not in ("torch", "accel_scan"):
+            raise ValueError(
+                "ParaLSTM scalar quasi-DEER scan_backend must be 'torch' or 'accel_scan'."
+            )
+
+        cfg = DeerNewtonConfig(
+            num_iters=num_iters,
+            tol=tol,
+            strict_tol=strict_tol,
+            stopping_criterion="update",
+            initial_guess=initial_guess,  # type: ignore[arg-type]
+            quasi=True,
+            scan_backend=scan_backend,
+            accel_module=accel_module,
+        )
+        cfg.jacobian_backend = "explicit"
+        cfg.backward_backend = "autograd"
+        cfg.paralstm_deer_kind = "scalar_quasi"
+        return cfg
+
+    raise ValueError(
+        f"Unknown ParaLSTM backend {backend!r}. Expected 'autograd', "
+        "'block_deer_autograd_torch', 'adjoint', 'block_deer_adjoint_torch', "
+        "'quasi', 'quasi_autograd', 'quasi_deer_autograd_torch', "
+        "or 'quasi_deer_autograd_accel_scan'."
+    )
+
+
+_ParaLSTM_forward_deer_states_before_block_adjoint = ParaLSTM.forward_deer_states
+
+
+def _paralstm_forward_deer_states_with_block_adjoint(
+    self,
+    x_batched: torch.Tensor,
+    initial_state: torch.Tensor,
+    deer_config: DeerNewtonConfig,
+) -> torch.Tensor:
+    cfg = deer_config
+
+    if (
+        getattr(cfg, "paralstm_deer_kind", "block2") == "block2"
+        and getattr(cfg, "backward_backend", "autograd") == "adjoint"
+    ):
+        if not cfg.quasi:
+            raise ValueError("ParaLSTM block adjoint DEER requires quasi=True.")
+        if cfg.scan_backend != "torch":
+            raise ValueError(
+                "ParaLSTM block adjoint DEER currently supports scan_backend='torch' only."
+            )
+        if getattr(cfg, "jacobian_backend", "explicit") != "explicit":
+            raise ValueError(
+                "ParaLSTM block adjoint DEER requires jacobian_backend='explicit'."
+            )
+        if cfg.return_trace:
+            raise ValueError(
+                "ParaLSTM block adjoint DEER does not support return_trace=True."
+            )
+        if cfg.stopping_criterion not in ("update", "merit"):
+            raise ValueError("stopping_criterion must be 'update' or 'merit'.")
+
+        states = paralstm_block_adjoint_deer_forward(
+            drivers=x_batched,
+            initial_state=initial_state,
+            A=self.cell.A,
+            B=self.cell.B,
+            C=self.cell.C,
+            b=self.cell.b,
+            cfg=cfg,
+        )
+
+        with torch.no_grad():
+            initial_blocks = _flat_to_blocks(initial_state, self.hidden_size)
+            final_merit = self._block_deer_merit(
+                initial_blocks=initial_blocks.detach(),
+                states=_flat_to_blocks(states.detach(), self.hidden_size),
+                drivers=x_batched.detach(),
+            )
+
+        self.last_deer_infos = [
+            {
+                "num_iters": cfg.num_iters,
+                "initial_merit": None,
+                "final_merit": final_merit.detach(),
+                "last_update_error": None,
+                "tol": cfg.tol,
+                "effective_tol": None,
+                "strict_tol": cfg.strict_tol,
+                "stopping_criterion": cfg.stopping_criterion,
+                "scan_backend": "torch_block2_associative_scan",
+                "quasi": True,
+                "batched": True,
+                "batch_size": x_batched.shape[0],
+                "jacobian_backend": "explicit_block2",
+                "linearization_backend": "custom_block2",
+                "backward_backend": "adjoint",
+                "cell_variant": "cifg_peephole_diag",
+                "paralstm_deer_kind": "block2",
+            }
+        ]
+
+        return states
+
+    return _ParaLSTM_forward_deer_states_before_block_adjoint(
+        self,
+        x_batched=x_batched,
+        initial_state=initial_state,
+        deer_config=cfg,
+    )
+
+
+ParaLSTM.forward_deer_states = _paralstm_forward_deer_states_with_block_adjoint
+
+try:
+    ParaLSTMBackend = Literal[
+        "autograd",
+        "block_deer_autograd_torch",
+        "adjoint",
+        "block_deer_adjoint_torch",
+        "quasi",
+        "quasi_autograd",
+        "quasi_deer_autograd_torch",
+        "quasi_deer_autograd_accel_scan",
+    ]
+except Exception:
+    pass
+
+# === End ParaLSTM block-2 custom adjoint extension ===
