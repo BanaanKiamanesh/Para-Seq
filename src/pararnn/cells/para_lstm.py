@@ -949,3 +949,298 @@ class ParaLSTM(BaseParaRNNCell):
         if cfg.stopping_criterion not in ("update", "merit"):
             raise ValueError("stopping_criterion must be 'update' or 'merit'.")
 
+
+# === ParaLSTM scalar quasi-DEER extension ===
+#
+# Existing ParaLSTM block-DEER keeps the exact 2x2 block Jacobian for each
+# coordinate pair (c_i, h_i). This extension adds an approximate scalar
+# quasi-DEER backend by keeping only the diagonal entries of each 2x2 block:
+#
+#     diag([[dc/dc, dc/dh],
+#           [dh/dc, dh/dh]])
+#     =
+#     [dc/dc, dh/dh].
+#
+# The flat state ordering remains concat(c, h), so the diagonal ordering is
+# concat(diag(dc/dc), diag(dh/dh)).
+
+from src.algos.DEER import deer_alg_batched as _paralstm_scalar_quasi_deer_alg_batched
+
+
+def functional_paralstm_linearization_diag_from_previous_flat(
+    previous_states: torch.Tensor,
+    drivers: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    b: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    hidden_size = A.shape[1]
+
+    if previous_states.ndim != 3:
+        raise ValueError(
+            "previous_states must have shape (B, T, 2H), got "
+            f"{tuple(previous_states.shape)}."
+        )
+
+    if previous_states.shape[-1] != 2 * hidden_size:
+        raise ValueError(
+            f"Expected previous_states.shape[-1] == {2 * hidden_size}, "
+            f"got {previous_states.shape[-1]}."
+        )
+
+    previous_blocks = _flat_to_blocks(previous_states, hidden_size=hidden_size)
+
+    predicted_blocks, jacobian_blocks = functional_paralstm_linearization_blocks_from_previous(
+        previous_states=previous_blocks,
+        drivers=drivers,
+        A=A,
+        B=B,
+        C=C,
+        b=b,
+    )
+
+    predicted_flat = _blocks_to_flat(predicted_blocks)
+
+    dc_dc = jacobian_blocks[..., 0, 0]
+    dh_dh = jacobian_blocks[..., 1, 1]
+
+    jacobian_diag = torch.cat([dc_dc, dh_dh], dim=-1)
+
+    return predicted_flat, jacobian_diag
+
+
+def _paralstm_cell_compute_linearization_diag_from_previous_flat(
+    self,
+    previous_states: torch.Tensor,
+    drivers: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return functional_paralstm_linearization_diag_from_previous_flat(
+        previous_states=previous_states,
+        drivers=drivers,
+        A=self.A,
+        B=self.B,
+        C=self.C,
+        b=self.b,
+    )
+
+
+def _paralstm_compute_linearization_diag_from_previous(
+    self,
+    previous_states: torch.Tensor,
+    drivers: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return self.cell.compute_linearization_diag_from_previous_flat(
+        previous_states=previous_states,
+        drivers=drivers,
+    )
+
+
+def _paralstm_compute_jacobians_diag_from_previous(
+    self,
+    previous_states: torch.Tensor,
+    drivers: torch.Tensor,
+) -> torch.Tensor:
+    _, jacobian_diag = self.compute_linearization_diag_from_previous(
+        previous_states=previous_states,
+        drivers=drivers,
+    )
+    return jacobian_diag
+
+
+ParaLSTMCell.compute_linearization_diag_from_previous_flat = (
+    _paralstm_cell_compute_linearization_diag_from_previous_flat
+)
+
+ParaLSTM.compute_linearization_diag_from_previous = (
+    _paralstm_compute_linearization_diag_from_previous
+)
+
+ParaLSTM._compute_jacobians_diag_from_previous = (
+    _paralstm_compute_jacobians_diag_from_previous
+)
+
+
+def make_paralstm_deer_config(
+    backend: str = "autograd",
+    *,
+    num_iters: int = 4,
+    tol: float | None = None,
+    strict_tol: bool = False,
+    initial_guess: str = "f0",
+    scan_backend: str = "torch",
+    accel_module: str = "warp",
+) -> DeerNewtonConfig:
+    """Construct a DEER config for ParaLSTM.
+
+    Backends:
+        autograd / block_deer_autograd_torch:
+            exact 2x2 block-DEER with torch block associative scan.
+
+        quasi / quasi_autograd / quasi_deer_autograd_torch:
+            approximate scalar quasi-DEER with torch diagonal scan.
+
+        quasi_deer_autograd_accel_scan:
+            approximate scalar quasi-DEER with accelerated_scan.
+    """
+    if backend == "block_deer_autograd_torch":
+        backend = "autograd"
+        scan_backend = "torch"
+
+    if backend == "quasi":
+        backend = "quasi_autograd"
+
+    if backend == "quasi_deer_autograd_torch":
+        backend = "quasi_autograd"
+        scan_backend = "torch"
+
+    if backend == "quasi_deer_autograd_accel_scan":
+        backend = "quasi_autograd"
+        scan_backend = "accel_scan"
+
+    if backend == "autograd":
+        if scan_backend != "torch":
+            raise ValueError(
+                "ParaLSTM exact block-DEER supports scan_backend='torch' only. "
+                "Use backend='quasi_autograd' for scan_backend='accel_scan'."
+            )
+
+        cfg = DeerNewtonConfig(
+            num_iters=num_iters,
+            tol=tol,
+            strict_tol=strict_tol,
+            stopping_criterion="update",
+            initial_guess=initial_guess,  # type: ignore[arg-type]
+            quasi=True,
+            scan_backend="torch",
+            accel_module=accel_module,
+        )
+        cfg.jacobian_backend = "explicit"
+        cfg.backward_backend = "autograd"
+        cfg.paralstm_deer_kind = "block2"
+        return cfg
+
+    if backend == "quasi_autograd":
+        if scan_backend not in ("torch", "accel_scan"):
+            raise ValueError(
+                "ParaLSTM scalar quasi-DEER scan_backend must be 'torch' or 'accel_scan'."
+            )
+
+        cfg = DeerNewtonConfig(
+            num_iters=num_iters,
+            tol=tol,
+            strict_tol=strict_tol,
+            stopping_criterion="update",
+            initial_guess=initial_guess,  # type: ignore[arg-type]
+            quasi=True,
+            scan_backend=scan_backend,
+            accel_module=accel_module,
+        )
+        cfg.jacobian_backend = "explicit"
+        cfg.backward_backend = "autograd"
+        cfg.paralstm_deer_kind = "scalar_quasi"
+        return cfg
+
+    raise ValueError(
+        f"Unknown ParaLSTM backend {backend!r}. Expected 'autograd', "
+        "'block_deer_autograd_torch', 'quasi', 'quasi_autograd', "
+        "'quasi_deer_autograd_torch', or 'quasi_deer_autograd_accel_scan'."
+    )
+
+
+_ParaLSTM_block_forward_deer_states = ParaLSTM.forward_deer_states
+
+
+def _paralstm_forward_deer_states_with_scalar_quasi(
+    self,
+    x_batched: torch.Tensor,
+    initial_state: torch.Tensor,
+    deer_config: DeerNewtonConfig,
+) -> torch.Tensor:
+    cfg = deer_config
+
+    if getattr(cfg, "paralstm_deer_kind", "block2") != "scalar_quasi":
+        return _ParaLSTM_block_forward_deer_states(
+            self,
+            x_batched=x_batched,
+            initial_state=initial_state,
+            deer_config=cfg,
+        )
+
+    if not cfg.quasi:
+        raise ValueError("ParaLSTM scalar quasi-DEER requires quasi=True.")
+
+    if cfg.scan_backend not in ("torch", "accel_scan"):
+        raise ValueError(
+            "ParaLSTM scalar quasi-DEER scan_backend must be 'torch' or 'accel_scan'."
+        )
+
+    if getattr(cfg, "jacobian_backend", "explicit") != "explicit":
+        raise ValueError(
+            "ParaLSTM scalar quasi-DEER requires jacobian_backend='explicit'."
+        )
+
+    if getattr(cfg, "backward_backend", "autograd") != "autograd":
+        raise ValueError(
+            "ParaLSTM scalar quasi-DEER currently supports "
+            "backward_backend='autograd' only."
+        )
+
+    if cfg.return_trace:
+        raise ValueError(
+            "ParaLSTM scalar quasi-DEER does not support return_trace=True yet."
+        )
+
+    states_guess = self.assemble_initial_guess_batched(
+        drivers=x_batched,
+        initial_state=initial_state,
+        guess_type=cfg.initial_guess,
+    )
+
+    accel_scan_fn = self._load_accel_scan_if_needed(cfg)
+
+    states, info = _paralstm_scalar_quasi_deer_alg_batched(
+        f=self.recurrence_step,
+        initial_state=initial_state,
+        states_guess=states_guess,
+        drivers=x_batched,
+        num_iters=cfg.num_iters,
+        tol=cfg.tol,
+        quasi=True,
+        damping=cfg.damping,
+        clip_value=cfg.clip_value,
+        return_trace=False,
+        scan_backend=cfg.scan_backend,
+        accel_scan_fn=accel_scan_fn,
+        strict_tol=cfg.strict_tol,
+        stopping_criterion=cfg.stopping_criterion,
+        linearization_fn=self.compute_linearization_diag_from_previous,
+    )
+
+    info = dict(info)
+    info["jacobian_backend"] = "explicit_scalar_diag_from_block2"
+    info["linearization_backend"] = "custom_scalar_diag_from_block2"
+    info["backward_backend"] = "autograd"
+    info["cell_variant"] = "cifg_peephole_diag_scalar_quasi"
+    info["paralstm_deer_kind"] = "scalar_quasi"
+
+    self.last_deer_infos = [info]
+
+    return states
+
+
+ParaLSTM.forward_deer_states = _paralstm_forward_deer_states_with_scalar_quasi
+
+try:
+    ParaLSTMBackend = Literal[
+        "autograd",
+        "block_deer_autograd_torch",
+        "quasi",
+        "quasi_autograd",
+        "quasi_deer_autograd_torch",
+        "quasi_deer_autograd_accel_scan",
+    ]
+except Exception:
+    pass
+
+# === End ParaLSTM scalar quasi-DEER extension ===

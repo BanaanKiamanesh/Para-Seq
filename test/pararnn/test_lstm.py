@@ -277,3 +277,139 @@ def test_invalid_paralstm_configs_raise():
     with pytest.raises(ValueError, match="scan_backend='torch'"):
         lstm(x)
 
+
+def test_paralstm_scalar_quasi_diag_matches_block_diagonal():
+    torch.manual_seed(51)
+
+    cell = ParaLSTMCell(input_size=3, hidden_size=5, dtype=torch.float64)
+
+    previous_flat = 0.15 * torch.randn(2, 6, 10, dtype=torch.float64)
+    drivers = 0.20 * torch.randn(2, 6, 3, dtype=torch.float64)
+
+    previous_blocks = _flat_to_blocks(previous_flat, hidden_size=5)
+
+    predicted_blocks, jac_blocks = cell.compute_linearization_blocks_from_previous(
+        previous_states=previous_blocks,
+        drivers=drivers,
+    )
+
+    predicted_flat, jac_diag = cell.compute_linearization_diag_from_previous_flat(
+        previous_states=previous_flat,
+        drivers=drivers,
+    )
+
+    expected_diag = torch.cat(
+        [
+            jac_blocks[..., 0, 0],
+            jac_blocks[..., 1, 1],
+        ],
+        dim=-1,
+    )
+
+    assert torch.max(torch.abs(predicted_flat[:, :, :5] - predicted_blocks[..., 0])).item() < 1e-12
+    assert torch.max(torch.abs(predicted_flat[:, :, 5:] - predicted_blocks[..., 1])).item() < 1e-12
+    assert torch.max(torch.abs(jac_diag - expected_diag)).item() < 1e-12
+
+
+def test_paralstm_scalar_quasi_deer_torch_backend_runs_and_backpropagates():
+    torch.manual_seed(52)
+
+    lstm = ParaLSTM(
+        input_size=3,
+        hidden_size=5,
+        batch_first=True,
+        mode="deer",
+        backend="quasi_autograd",
+        scan_backend="torch",
+        num_iters=16,
+        tol=1e-7,
+        dtype=torch.float64,
+        recurrent_init_scale=0.03,
+        peephole_init_scale=0.03,
+        forget_bias_init_value=0.20,
+    )
+
+    x = (0.15 * torch.randn(4, 10, 3, dtype=torch.float64)).detach().requires_grad_(True)
+
+    output, (h_n, c_n) = lstm(x)
+
+    loss = (
+        output.square().mean()
+        + 0.1 * h_n.square().mean()
+        + 0.1 * c_n.square().mean()
+    )
+    loss.backward()
+
+    assert output.shape == (4, 10, 5)
+    assert h_n.shape == (1, 4, 5)
+    assert c_n.shape == (1, 4, 5)
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    assert lstm.A.grad is not None and torch.isfinite(lstm.A.grad).all()
+    assert lstm.B.grad is not None and torch.isfinite(lstm.B.grad).all()
+    assert lstm.C.grad is not None and torch.isfinite(lstm.C.grad).all()
+
+    info = lstm.last_deer_infos[0]
+    assert info["quasi"] is True
+    assert info["scan_backend"] == "torch"
+    assert info["jacobian_backend"] == "explicit_scalar_diag_from_block2"
+    assert info["linearization_backend"] == "custom_scalar_diag_from_block2"
+    assert info["paralstm_deer_kind"] == "scalar_quasi"
+
+
+def test_paralstm_scalar_quasi_deer_accel_scan_backend_if_available():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available.")
+
+    try:
+        import accelerated_scan.warp  # noqa: F401
+    except Exception:
+        pytest.skip("accelerated_scan.warp is not available.")
+
+    torch.manual_seed(53)
+
+    lstm = ParaLSTM(
+        input_size=3,
+        hidden_size=4,
+        batch_first=True,
+        mode="deer",
+        backend="quasi_deer_autograd_accel_scan",
+        scan_backend="accel_scan",
+        num_iters=8,
+        tol=1e-4,
+        dtype=torch.float32,
+        recurrent_init_scale=0.03,
+        peephole_init_scale=0.03,
+        forget_bias_init_value=0.20,
+        device="cuda",
+    )
+
+    x = (
+        0.10
+        * torch.randn(
+            2,
+            64,
+            3,
+            device="cuda",
+            dtype=torch.float32,
+        )
+    ).detach().requires_grad_(True)
+
+    output, (h_n, c_n) = lstm(x)
+
+    loss = (
+        output.square().mean()
+        + 0.1 * h_n.square().mean()
+        + 0.1 * c_n.square().mean()
+    )
+    loss.backward()
+
+    assert output.shape == (2, 64, 4)
+    assert h_n.shape == (1, 2, 4)
+    assert c_n.shape == (1, 2, 4)
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+
+    info = lstm.last_deer_infos[0]
+    assert info["quasi"] is True
+    assert info["scan_backend"] == "accel_scan"
+    assert info["jacobian_backend"] == "explicit_scalar_diag_from_block2"
+

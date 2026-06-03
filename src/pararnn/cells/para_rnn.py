@@ -603,3 +603,309 @@ class ParaRNN(BaseParaRNNCell):
             )
         if cfg.stopping_criterion not in ("update", "merit"):
             raise ValueError("stopping_criterion must be 'update' or 'merit'.")
+
+
+# === Dense ParaRNN scalar quasi-DEER extension ===
+#
+# Existing dense ParaRNN full-DEER uses the exact dense Jacobian
+#
+#     J_t = diag(phi'(u_t)) @ W_hh.
+#
+# This extension adds approximate scalar quasi-DEER by keeping only
+#
+#     diag(J_t) = phi'(u_t) * diag(W_hh).
+#
+# Therefore the Newton linear solve becomes a diagonal affine recurrence and can
+# use either torch associative_scan or accelerated_scan.
+
+def functional_pararnn_linearization_diag_from_previous(
+    previous_states: torch.Tensor,
+    drivers: torch.Tensor,
+    weight_ih: torch.Tensor,
+    weight_hh: torch.Tensor,
+    bias_ih: torch.Tensor | None,
+    bias_hh: torch.Tensor | None,
+    nonlinearity: ParaRNNNonlinearity = "tanh",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if previous_states.ndim != 3:
+        raise ValueError(
+            "previous_states must have shape (B, T, H), got "
+            f"{tuple(previous_states.shape)}."
+        )
+
+    if drivers.ndim != 3:
+        raise ValueError(
+            "drivers must have shape (B, T, input_size), got "
+            f"{tuple(drivers.shape)}."
+        )
+
+    if previous_states.shape[:2] != drivers.shape[:2]:
+        raise ValueError(
+            "previous_states and drivers must share batch/time dimensions, got "
+            f"{tuple(previous_states.shape)} and {tuple(drivers.shape)}."
+        )
+
+    preactivation = drivers @ weight_ih.transpose(-1, -2)
+    preactivation = preactivation + previous_states @ weight_hh.transpose(-1, -2)
+
+    if bias_ih is not None:
+        preactivation = preactivation + bias_ih
+
+    if bias_hh is not None:
+        preactivation = preactivation + bias_hh
+
+    predicted_states = _apply_nonlinearity(preactivation, nonlinearity)
+
+    dphi = _nonlinearity_derivative_from_preactivation(
+        preactivation=preactivation,
+        output=predicted_states,
+        nonlinearity=nonlinearity,
+    )
+
+    recurrent_diag = torch.diagonal(weight_hh, dim1=-2, dim2=-1)
+    jacobian_diag = dphi * recurrent_diag
+
+    return predicted_states, jacobian_diag
+
+
+def _pararnn_cell_compute_linearization_diag_from_previous(
+    self,
+    previous_states: torch.Tensor,
+    drivers: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return functional_pararnn_linearization_diag_from_previous(
+        previous_states=previous_states,
+        drivers=drivers,
+        weight_ih=self.weight_ih,
+        weight_hh=self.weight_hh,
+        bias_ih=self.bias_ih,
+        bias_hh=self.bias_hh,
+        nonlinearity=self.nonlinearity,
+    )
+
+
+def _pararnn_compute_linearization_diag_from_previous(
+    self,
+    previous_states: torch.Tensor,
+    drivers: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return self.cell.compute_linearization_diag_from_previous(
+        previous_states=previous_states,
+        drivers=drivers,
+    )
+
+
+def _pararnn_compute_jacobians_diag_from_previous(
+    self,
+    previous_states: torch.Tensor,
+    drivers: torch.Tensor,
+) -> torch.Tensor:
+    _, jacobian_diag = self.compute_linearization_diag_from_previous(
+        previous_states=previous_states,
+        drivers=drivers,
+    )
+    return jacobian_diag
+
+
+ParaRNNCell.compute_linearization_diag_from_previous = (
+    _pararnn_cell_compute_linearization_diag_from_previous
+)
+
+ParaRNN.compute_linearization_diag_from_previous = (
+    _pararnn_compute_linearization_diag_from_previous
+)
+
+ParaRNN._compute_jacobians_diag_from_previous = (
+    _pararnn_compute_jacobians_diag_from_previous
+)
+
+
+def make_pararnn_deer_config(
+    backend: str = "autograd",
+    *,
+    num_iters: int = 4,
+    tol: float | None = None,
+    strict_tol: bool = False,
+    initial_guess: str = "f0",
+    scan_backend: str = "torch",
+    accel_module: str = "warp",
+) -> DeerNewtonConfig:
+    """Construct a DEER config for dense vanilla ParaRNN.
+
+    Backends:
+        autograd / dense_deer_autograd_torch:
+            exact dense full-DEER with torch dense associative scan.
+
+        quasi / quasi_autograd / quasi_deer_autograd_torch:
+            approximate scalar quasi-DEER with torch diagonal scan.
+
+        quasi_deer_autograd_accel_scan:
+            approximate scalar quasi-DEER with accelerated_scan.
+    """
+    if backend in ("dense_deer_autograd_torch", "full", "full_deer_autograd_torch"):
+        backend = "autograd"
+        scan_backend = "torch"
+
+    if backend == "quasi":
+        backend = "quasi_autograd"
+
+    if backend == "quasi_deer_autograd_torch":
+        backend = "quasi_autograd"
+        scan_backend = "torch"
+
+    if backend == "quasi_deer_autograd_accel_scan":
+        backend = "quasi_autograd"
+        scan_backend = "accel_scan"
+
+    if backend == "autograd":
+        if scan_backend != "torch":
+            raise ValueError(
+                "Full dense ParaRNN DEER supports scan_backend='torch' only. "
+                "Use backend='quasi_autograd' for scan_backend='accel_scan'."
+            )
+
+        cfg = DeerNewtonConfig(
+            num_iters=num_iters,
+            tol=tol,
+            strict_tol=strict_tol,
+            stopping_criterion="update",
+            initial_guess=initial_guess,  # type: ignore[arg-type]
+            quasi=False,
+            scan_backend="torch",
+            accel_module=accel_module,
+        )
+        cfg.jacobian_backend = "explicit"
+        cfg.backward_backend = "autograd"
+        cfg.pararnn_deer_kind = "full_dense"
+        return cfg
+
+    if backend == "quasi_autograd":
+        if scan_backend not in ("torch", "accel_scan"):
+            raise ValueError(
+                "ParaRNN quasi-DEER scan_backend must be 'torch' or 'accel_scan'."
+            )
+
+        cfg = DeerNewtonConfig(
+            num_iters=num_iters,
+            tol=tol,
+            strict_tol=strict_tol,
+            stopping_criterion="update",
+            initial_guess=initial_guess,  # type: ignore[arg-type]
+            quasi=True,
+            scan_backend=scan_backend,
+            accel_module=accel_module,
+        )
+        cfg.jacobian_backend = "explicit"
+        cfg.backward_backend = "autograd"
+        cfg.pararnn_deer_kind = "scalar_quasi"
+        return cfg
+
+    raise ValueError(
+        f"Unknown ParaRNN backend {backend!r}. Expected 'autograd', "
+        "'dense_deer_autograd_torch', 'quasi', 'quasi_autograd', "
+        "'quasi_deer_autograd_torch', or 'quasi_deer_autograd_accel_scan'."
+    )
+
+
+_ParaRNN_full_dense_forward_deer = ParaRNN.forward_deer
+
+
+def _pararnn_forward_deer_with_quasi(
+    self,
+    x: torch.Tensor,
+    initial_state: torch.Tensor | None = None,
+    deer_config: DeerNewtonConfig | None = None,
+) -> torch.Tensor:
+    cfg = self.config.deer if deer_config is None else deer_config
+
+    if not getattr(cfg, "quasi", False):
+        return _ParaRNN_full_dense_forward_deer(
+            self,
+            x=x,
+            initial_state=initial_state,
+            deer_config=cfg,
+        )
+
+    if cfg.scan_backend not in ("torch", "accel_scan"):
+        raise ValueError(
+            "ParaRNN quasi-DEER scan_backend must be 'torch' or 'accel_scan'."
+        )
+
+    if getattr(cfg, "jacobian_backend", "explicit") != "explicit":
+        raise ValueError("ParaRNN quasi-DEER requires jacobian_backend='explicit'.")
+
+    if getattr(cfg, "backward_backend", "autograd") != "autograd":
+        raise ValueError(
+            "ParaRNN quasi-DEER currently supports backward_backend='autograd' only."
+        )
+
+    if cfg.return_trace:
+        raise ValueError("ParaRNN quasi-DEER does not support return_trace=True yet.")
+
+    x_batched, had_batch_dim = self._normalize_input(x)
+
+    initial_state_batched = self._normalize_initial_state(
+        x_batched=x_batched,
+        initial_state=initial_state,
+    )
+
+    states_guess = self.assemble_initial_guess_batched(
+        drivers=x_batched,
+        initial_state=initial_state_batched,
+        guess_type=cfg.initial_guess,
+    )
+
+    accel_scan_fn = self._load_accel_scan_if_needed(cfg)
+
+    states, info = deer_alg_batched(
+        f=self.recurrence_step,
+        initial_state=initial_state_batched,
+        states_guess=states_guess,
+        drivers=x_batched,
+        num_iters=cfg.num_iters,
+        tol=cfg.tol,
+        quasi=True,
+        damping=cfg.damping,
+        clip_value=cfg.clip_value,
+        return_trace=False,
+        scan_backend=cfg.scan_backend,
+        accel_scan_fn=accel_scan_fn,
+        strict_tol=cfg.strict_tol,
+        stopping_criterion=cfg.stopping_criterion,
+        linearization_fn=self.compute_linearization_diag_from_previous,
+    )
+
+    info = dict(info)
+    info["jacobian_backend"] = "explicit_diag_from_dense"
+    info["linearization_backend"] = "custom_diag_from_dense"
+    info["backward_backend"] = "autograd"
+    info["cell_variant"] = f"dense_vanilla_{self.nonlinearity}_scalar_quasi"
+    info["pararnn_deer_kind"] = "scalar_quasi"
+
+    self.last_deer_infos = [info]
+
+    outputs = self.post_process(states)
+
+    return self._restore_output_layout(
+        outputs,
+        had_batch_dim=had_batch_dim,
+    )
+
+
+ParaRNN.forward_deer = _pararnn_forward_deer_with_quasi
+
+try:
+    ParaRNNBackend = Literal[
+        "autograd",
+        "dense_deer_autograd_torch",
+        "full",
+        "full_deer_autograd_torch",
+        "quasi",
+        "quasi_autograd",
+        "quasi_deer_autograd_torch",
+        "quasi_deer_autograd_accel_scan",
+    ]
+except Exception:
+    pass
+
+# === End dense ParaRNN scalar quasi-DEER extension ===

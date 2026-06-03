@@ -259,10 +259,134 @@ def test_invalid_pararnn_configs_raise():
     with pytest.raises(ValueError, match="nonlinearity"):
         ParaRNN(input_size=3, hidden_size=4, nonlinearity="sigmoid")
 
-    bad_cfg = make_pararnn_deer_config()
-    bad_cfg.quasi = True
-    rnn = ParaRNN(input_size=3, hidden_size=4, deer_config=bad_cfg, dtype=torch.float64)
-    x = 0.5 * torch.randn(2, 7, 3, dtype=torch.float64)
+    # Full dense ParaRNN DEER uses dense Jacobians, so it cannot use
+    # the diagonal accelerated_scan backend.
+    with pytest.raises(ValueError, match="Full dense ParaRNN DEER supports"):
+        make_pararnn_deer_config(
+            backend="autograd",
+            scan_backend="accel_scan",
+        )
 
-    with pytest.raises(ValueError, match="quasi=False"):
-        rnn(x, mode="deer")
+    # Quasi-DEER is now intentionally supported, but only with torch or accel_scan.
+    with pytest.raises(ValueError, match="scan_backend"):
+        make_pararnn_deer_config(
+            backend="quasi_autograd",
+            scan_backend="bad_backend",
+        )
+
+def test_pararnn_quasi_diag_matches_dense_jacobian_diagonal():
+    torch.manual_seed(41)
+
+    cell = ParaRNNCell(input_size=3, hidden_size=5, dtype=torch.float64)
+
+    previous_states = 0.20 * torch.randn(2, 7, 5, dtype=torch.float64)
+    drivers = 0.25 * torch.randn(2, 7, 3, dtype=torch.float64)
+
+    predicted_dense, jac_dense = cell.compute_linearization_dense_from_previous(
+        previous_states=previous_states,
+        drivers=drivers,
+    )
+    predicted_diag, jac_diag = cell.compute_linearization_diag_from_previous(
+        previous_states=previous_states,
+        drivers=drivers,
+    )
+
+    assert torch.max(torch.abs(predicted_dense - predicted_diag)).item() < 1e-12
+    assert torch.max(
+        torch.abs(jac_diag - torch.diagonal(jac_dense, dim1=-2, dim2=-1))
+    ).item() < 1e-12
+
+
+def test_pararnn_quasi_deer_torch_backend_runs_and_backpropagates():
+    torch.manual_seed(42)
+
+    rnn = ParaRNN(
+        input_size=3,
+        hidden_size=5,
+        batch_first=True,
+        mode="deer",
+        backend="quasi_autograd",
+        scan_backend="torch",
+        num_iters=16,
+        tol=1e-7,
+        dtype=torch.float64,
+    )
+
+    with torch.no_grad():
+        rnn.weight_hh.mul_(0.05)
+        rnn.weight_ih.mul_(0.25)
+
+    x = (0.20 * torch.randn(4, 12, 3, dtype=torch.float64)).detach().requires_grad_(True)
+
+    output, h_n = rnn(x)
+
+    loss = output.square().mean() + 0.1 * h_n.square().mean()
+    loss.backward()
+
+    assert output.shape == (4, 12, 5)
+    assert h_n.shape == (1, 4, 5)
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    assert rnn.weight_hh.grad is not None and torch.isfinite(rnn.weight_hh.grad).all()
+    assert rnn.weight_ih.grad is not None and torch.isfinite(rnn.weight_ih.grad).all()
+
+    info = rnn.last_deer_infos[0]
+    assert info["quasi"] is True
+    assert info["scan_backend"] == "torch"
+    assert info["jacobian_backend"] == "explicit_diag_from_dense"
+    assert info["linearization_backend"] == "custom_diag_from_dense"
+    assert info["pararnn_deer_kind"] == "scalar_quasi"
+
+
+def test_pararnn_quasi_deer_accel_scan_backend_if_available():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available.")
+
+    try:
+        import accelerated_scan.warp  # noqa: F401
+    except Exception:
+        pytest.skip("accelerated_scan.warp is not available.")
+
+    torch.manual_seed(43)
+
+    rnn = ParaRNN(
+        input_size=3,
+        hidden_size=4,
+        batch_first=True,
+        mode="deer",
+        backend="quasi_deer_autograd_accel_scan",
+        scan_backend="accel_scan",
+        num_iters=8,
+        tol=1e-4,
+        dtype=torch.float32,
+        device="cuda",
+    )
+
+    with torch.no_grad():
+        rnn.weight_hh.mul_(0.04)
+        rnn.weight_ih.mul_(0.20)
+
+    x = (
+        0.10
+        * torch.randn(
+            2,
+            64,
+            3,
+            device="cuda",
+            dtype=torch.float32,
+        )
+    ).detach().requires_grad_(True)
+
+    output, h_n = rnn(x)
+
+    loss = output.square().mean() + 0.1 * h_n.square().mean()
+    loss.backward()
+
+    assert output.shape == (2, 64, 4)
+    assert h_n.shape == (1, 2, 4)
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+
+    info = rnn.last_deer_infos[0]
+    assert info["quasi"] is True
+    assert info["scan_backend"] == "accel_scan"
+    assert info["jacobian_backend"] == "explicit_diag_from_dense"
+
