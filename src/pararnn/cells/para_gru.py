@@ -665,3 +665,112 @@ class ParaGRU(BaseParaRNNCell):
             previous_states=previous_states,
             drivers=drivers,
         )
+
+
+# === ParaGRU ELK layer API extension ===
+
+def make_paragru_elk_config(
+    *,
+    num_iters: int = 8,
+    tol: float | None = None,
+    strict_tol: bool = False,
+    initial_guess: str = "f0",
+    scan_backend: Literal["torch", "accel_scan"] = "torch",
+    accel_module: str = "warp",
+    sigmasq: float = 1e8,
+    process_noise: float = 1.0,
+) -> DeerNewtonConfig:
+    """Construct a quasi-ELK config for ParaGRU.
+
+    ParaGRU has an exact diagonal recurrent Jacobian, so its ELK layer backend
+    is the diagonal/quasi-ELK backend.
+    """
+    cfg = DeerNewtonConfig(
+        num_iters=num_iters,
+        tol=tol,
+        strict_tol=strict_tol,
+        stopping_criterion="update",
+        initial_guess=initial_guess,  # type: ignore[arg-type]
+        quasi=True,
+        scan_backend=scan_backend,
+        accel_module=accel_module,
+        jacobian_backend="explicit",
+        backward_backend="autograd",
+    )
+    cfg.solver = "elk"
+    cfg.sigmasq = float(sigmasq)
+    cfg.process_noise = float(process_noise)
+    cfg.paragru_elk_kind = "quasi"
+    return cfg
+
+
+_ParaGRU_init_before_elk = ParaGRU.__init__
+
+
+def _paragru_init_with_elk(
+    self,
+    *args,
+    solver: str = "deer",
+    elk_sigmasq: float = 1e8,
+    elk_process_noise: float = 1.0,
+    **kwargs,
+):
+    if solver in ("elk", "quasi_elk"):
+        requested_mode = kwargs.get("mode", None)
+        if requested_mode is None or requested_mode == "deer":
+            kwargs["mode"] = "elk"
+
+        if kwargs.get("deer_config", None) is None:
+            kwargs["deer_config"] = make_paragru_elk_config(
+                num_iters=kwargs.get("num_iters", 8),
+                tol=kwargs.get("tol", None),
+                strict_tol=kwargs.get("strict_tol", False),
+                scan_backend=kwargs.get("scan_backend", "torch"),
+                accel_module=kwargs.get("accel_module", "warp"),
+                sigmasq=elk_sigmasq,
+                process_noise=elk_process_noise,
+            )
+        else:
+            cfg = kwargs["deer_config"]
+            cfg.solver = "elk"
+            cfg.sigmasq = float(elk_sigmasq)
+            cfg.process_noise = float(elk_process_noise)
+
+        _ParaGRU_init_before_elk(self, *args, **kwargs)
+        self.solver = "elk"
+        return
+
+    _ParaGRU_init_before_elk(self, *args, **kwargs)
+    self.solver = getattr(self.config.deer, "solver", "deer")
+
+
+_ParaGRU_forward_before_elk = ParaGRU.forward
+
+
+def _paragru_forward_with_elk(
+    self,
+    input: torch.Tensor,
+    hx: torch.Tensor | None = None,
+    *,
+    mode: Literal["sequential", "deer", "elk"] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    selected_mode = self.mode if mode is None else mode
+
+    if selected_mode == "elk":
+        initial_state, unbatched_input = self._hx_to_initial_state(input, hx)
+        output = self.forward_elk(input, initial_state=initial_state)
+        h_n = self._make_h_n(output, unbatched_input=unbatched_input)
+        return output, h_n
+
+    return _ParaGRU_forward_before_elk(
+        self,
+        input=input,
+        hx=hx,
+        mode=mode,
+    )
+
+
+ParaGRU.__init__ = _paragru_init_with_elk
+ParaGRU.forward = _paragru_forward_with_elk
+
+# === End ParaGRU ELK layer API extension ===

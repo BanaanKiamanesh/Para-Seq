@@ -52,3 +52,21 @@ __all__ = [
     "ParaLSTMBackend",
     "make_paralstm_deer_config",
 ]
+
+
+# === ELK API exports extension ===
+try:
+    from src.pararnn.cells.para_gru import make_paragru_elk_config
+    from src.pararnn.cells.para_rnn import make_pararnn_elk_config
+    from src.pararnn.cells.para_lstm import make_paralstm_elk_config
+except ImportError:
+    pass
+else:
+    for _name in [
+        "make_paragru_elk_config",
+        "make_pararnn_elk_config",
+        "make_paralstm_elk_config",
+    ]:
+        if _name not in __all__:
+            __all__.append(_name)
+# === End ELK API exports extension ===

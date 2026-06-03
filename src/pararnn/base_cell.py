@@ -647,3 +647,127 @@ class BaseParaRNNCell(torch.nn.Module, abc.ABC):
 
 
 BaseDeerRNNCell = BaseParaRNNCell
+
+
+# === BaseParaRNNCell ELK layer API extension ===
+
+from src.algos.ELK import elk_alg_batched
+
+
+def _base_make_elk_linearization_fn(self, cfg: DeerNewtonConfig):
+    jacobian_backend = getattr(cfg, "jacobian_backend", "autograd")
+
+    if jacobian_backend == "autograd":
+        return None
+
+    if jacobian_backend != "explicit":
+        raise ValueError(
+            "Unknown jacobian_backend "
+            f"{jacobian_backend!r}. Expected 'autograd' or 'explicit'."
+        )
+
+    if not cfg.quasi:
+        return None
+
+    if not hasattr(self, "compute_linearization_diag_from_previous"):
+        return None
+
+    def linearization_fn(
+        previous_states: torch.Tensor,
+        drivers: torch.Tensor,
+    ):
+        return self.compute_linearization_diag_from_previous(
+            previous_states=previous_states,
+            drivers=drivers,
+        )
+
+    return linearization_fn
+
+
+def _base_forward_elk(
+    self,
+    x: torch.Tensor,
+    initial_state: Optional[torch.Tensor] = None,
+    elk_config: Optional[DeerNewtonConfig] = None,
+) -> torch.Tensor:
+    cfg = self.config.deer if elk_config is None else elk_config
+
+    x_batched, had_batch_dim = self._normalize_input(x)
+    initial_state_batched = self._normalize_initial_state(
+        x_batched=x_batched,
+        initial_state=initial_state,
+    )
+
+    states_guess = self.assemble_initial_guess_batched(
+        drivers=x_batched,
+        initial_state=initial_state_batched,
+        guess_type=cfg.initial_guess,
+    )
+
+    accel_scan_fn = self._load_accel_scan_if_needed(cfg)
+    linearization_fn = self._make_elk_linearization_fn(cfg)
+
+    states, info = elk_alg_batched(
+        f=self.recurrence_step,
+        initial_state=initial_state_batched,
+        states_guess=states_guess,
+        drivers=x_batched,
+        sigmasq=getattr(cfg, "sigmasq", 1e8),
+        process_noise=getattr(cfg, "process_noise", 1.0),
+        num_iters=cfg.num_iters,
+        tol=cfg.tol,
+        quasi=cfg.quasi,
+        damping=cfg.damping,
+        clip_value=cfg.clip_value,
+        return_trace=cfg.return_trace,
+        scan_backend=cfg.scan_backend,
+        accel_scan_fn=accel_scan_fn,
+        strict_tol=cfg.strict_tol,
+        stopping_criterion=cfg.stopping_criterion,
+        linearization_fn=linearization_fn,
+    )
+
+    info = dict(info)
+    info["solver"] = "elk"
+    info["backward_backend"] = getattr(cfg, "backward_backend", "autograd")
+
+    self.last_deer_infos = [info]
+
+    outputs = self.post_process(states)
+
+    return self._restore_output_layout(
+        outputs,
+        had_batch_dim=had_batch_dim,
+    )
+
+
+_BaseParaRNNCell_forward_before_elk = BaseParaRNNCell.forward
+
+
+def _base_forward_with_elk(
+    self,
+    x: torch.Tensor,
+    initial_state: Optional[torch.Tensor] = None,
+    mode: Optional[str] = None,
+) -> torch.Tensor:
+    selected_mode = self.mode if mode is None else mode
+
+    if selected_mode == "elk":
+        return self.forward_elk(
+            x=x,
+            initial_state=initial_state,
+        )
+
+    return _BaseParaRNNCell_forward_before_elk(
+        self,
+        x=x,
+        initial_state=initial_state,
+        mode=mode,
+    )
+
+
+BaseParaRNNCell._make_elk_linearization_fn = _base_make_elk_linearization_fn
+BaseParaRNNCell.forward_elk = _base_forward_elk
+BaseParaRNNCell.forward = _base_forward_with_elk
+
+# === End BaseParaRNNCell ELK layer API extension ===

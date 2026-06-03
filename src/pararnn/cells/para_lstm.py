@@ -1445,3 +1445,196 @@ except Exception:
     pass
 
 # === End ParaLSTM block-2 custom adjoint extension ===
+
+
+# === ParaLSTM ELK layer API extension ===
+
+from src.algos.ELK import elk_alg_batched
+
+
+def make_paralstm_elk_config(
+    *,
+    num_iters: int = 8,
+    tol: float | None = None,
+    strict_tol: bool = False,
+    initial_guess: str = "f0",
+    scan_backend: str = "torch",
+    accel_module: str = "warp",
+    sigmasq: float = 1e8,
+    process_noise: float = 1.0,
+) -> DeerNewtonConfig:
+    """Construct a scalar quasi-ELK config for ParaLSTM.
+
+    The exact paper-faithful ParaLSTM state has 2x2 coordinate blocks.
+    This high-level ELK backend uses the existing scalar quasi approximation:
+    it keeps only diag(dc_t/dc_{t-1}) and diag(dh_t/dh_{t-1}) in the flat
+    concat(c,h) state ordering.
+    """
+    if scan_backend not in ("torch", "accel_scan"):
+        raise ValueError("ParaLSTM quasi-ELK scan_backend must be 'torch' or 'accel_scan'.")
+
+    cfg = DeerNewtonConfig(
+        num_iters=num_iters,
+        tol=tol,
+        strict_tol=strict_tol,
+        stopping_criterion="update",
+        initial_guess=initial_guess,  # type: ignore[arg-type]
+        quasi=True,
+        scan_backend=scan_backend,
+        accel_module=accel_module,
+        jacobian_backend="explicit",
+        backward_backend="autograd",
+    )
+    cfg.solver = "elk"
+    cfg.sigmasq = float(sigmasq)
+    cfg.process_noise = float(process_noise)
+    cfg.paralstm_elk_kind = "scalar_quasi"
+    return cfg
+
+
+def _paralstm_forward_elk_states(
+    self,
+    x_batched: torch.Tensor,
+    initial_state: torch.Tensor,
+    elk_config: DeerNewtonConfig,
+) -> torch.Tensor:
+    cfg = elk_config
+
+    if not cfg.quasi:
+        raise ValueError("ParaLSTM ELK currently supports scalar quasi-ELK only.")
+
+    if cfg.scan_backend not in ("torch", "accel_scan"):
+        raise ValueError("ParaLSTM quasi-ELK scan_backend must be 'torch' or 'accel_scan'.")
+
+    if getattr(cfg, "jacobian_backend", "explicit") != "explicit":
+        raise ValueError("ParaLSTM quasi-ELK requires jacobian_backend='explicit'.")
+
+    states_guess = self.assemble_initial_guess_batched(
+        drivers=x_batched,
+        initial_state=initial_state,
+        guess_type=cfg.initial_guess,
+    )
+
+    accel_scan_fn = self._load_accel_scan_if_needed(cfg)
+
+    states, info = elk_alg_batched(
+        f=self.recurrence_step,
+        initial_state=initial_state,
+        states_guess=states_guess,
+        drivers=x_batched,
+        sigmasq=getattr(cfg, "sigmasq", 1e8),
+        process_noise=getattr(cfg, "process_noise", 1.0),
+        num_iters=cfg.num_iters,
+        tol=cfg.tol,
+        quasi=True,
+        damping=cfg.damping,
+        clip_value=cfg.clip_value,
+        return_trace=False,
+        scan_backend=cfg.scan_backend,
+        accel_scan_fn=accel_scan_fn,
+        strict_tol=cfg.strict_tol,
+        stopping_criterion=cfg.stopping_criterion,
+        linearization_fn=self.compute_linearization_diag_from_previous,
+    )
+
+    info = dict(info)
+    info["jacobian_backend"] = "explicit_scalar_diag_from_block2"
+    info["linearization_backend"] = "custom_scalar_diag_from_block2"
+    info["backward_backend"] = "autograd"
+    info["cell_variant"] = "cifg_peephole_diag_scalar_quasi_elk"
+    info["paralstm_elk_kind"] = "scalar_quasi"
+    self.last_deer_infos = [info]
+
+    return states
+
+
+_ParaLSTM_init_before_elk = ParaLSTM.__init__
+
+
+def _paralstm_init_with_elk(
+    self,
+    *args,
+    solver: str = "deer",
+    elk_sigmasq: float = 1e8,
+    elk_process_noise: float = 1.0,
+    **kwargs,
+):
+    if solver in ("elk", "quasi_elk", "scalar_quasi_elk"):
+        requested_mode = kwargs.get("mode", None)
+        if requested_mode is None or requested_mode in ("sequential", "deer"):
+            kwargs["mode"] = "elk"
+
+        if kwargs.get("deer_config", None) is None:
+            kwargs["deer_config"] = make_paralstm_elk_config(
+                num_iters=kwargs.get("num_iters", 8),
+                tol=kwargs.get("tol", None),
+                strict_tol=kwargs.get("strict_tol", False),
+                scan_backend=kwargs.get("scan_backend", "torch"),
+                accel_module=kwargs.get("accel_module", "warp"),
+                sigmasq=elk_sigmasq,
+                process_noise=elk_process_noise,
+            )
+        else:
+            cfg = kwargs["deer_config"]
+            cfg.solver = "elk"
+            cfg.sigmasq = float(elk_sigmasq)
+            cfg.process_noise = float(elk_process_noise)
+
+        _ParaLSTM_init_before_elk(self, *args, **kwargs)
+        self.solver = "elk"
+        return
+
+    _ParaLSTM_init_before_elk(self, *args, **kwargs)
+    self.solver = getattr(self.config.deer, "solver", "deer")
+
+
+_ParaLSTM_forward_before_elk = ParaLSTM.forward
+
+
+def _paralstm_forward_with_elk(
+    self,
+    input: torch.Tensor,
+    hx: tuple[torch.Tensor, torch.Tensor] | None = None,
+    *,
+    mode: Literal["sequential", "deer", "elk"] | None = None,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    selected_mode = self.mode if mode is None else mode
+
+    if selected_mode != "elk":
+        return _ParaLSTM_forward_before_elk(
+            self,
+            input=input,
+            hx=hx,
+            mode=mode,
+        )
+
+    x_batched, had_batch_dim = self._normalize_input(input)
+    unbatched_input = not had_batch_dim
+
+    initial_state = self._normalize_lstm_hx(
+        x_batched=x_batched,
+        hx=hx,
+        unbatched_input=unbatched_input,
+    )
+
+    states = self.forward_elk_states(
+        x_batched=x_batched,
+        initial_state=initial_state,
+        elk_config=self.config.deer,
+    )
+
+    outputs_batched = self.post_process(states)
+    output = self._restore_output_layout(
+        outputs_batched,
+        had_batch_dim=had_batch_dim,
+    )
+    h_n, c_n = self._make_h_c_n(states, unbatched_input=unbatched_input)
+
+    return output, (h_n, c_n)
+
+
+ParaLSTM.forward_elk_states = _paralstm_forward_elk_states
+ParaLSTM.__init__ = _paralstm_init_with_elk
+ParaLSTM.forward = _paralstm_forward_with_elk
+
+# === End ParaLSTM ELK layer API extension ===

@@ -748,3 +748,407 @@ def elk_alg(
         info["trace"] = torch.stack(trace, dim=0)
 
     return states, info
+
+
+# === Batched ELK layer integration extension ===
+
+from src.algos.DEER import merit_fxn_batched
+
+
+def _elk_validate_linearization_shapes(
+    predicted: torch.Tensor,
+    jacobian: torch.Tensor,
+    previous_states: torch.Tensor,
+) -> None:
+    if predicted.shape != previous_states.shape:
+        raise ValueError(
+            "linearization_fn must return predicted states with the same shape "
+            "as previous_states. Got predicted="
+            f"{tuple(predicted.shape)} and previous_states={tuple(previous_states.shape)}."
+        )
+
+    expected_diag = tuple(previous_states.shape)
+    expected_dense = expected_diag + (previous_states.shape[-1],)
+
+    if tuple(jacobian.shape) == expected_diag:
+        return
+
+    if tuple(jacobian.shape) == expected_dense:
+        return
+
+    raise ValueError(
+        "linearization_fn returned an incompatible Jacobian shape. "
+        f"Expected diagonal shape {expected_diag} or dense shape {expected_dense}, "
+        f"got {tuple(jacobian.shape)}."
+    )
+
+
+def _elk_linearize_batched(
+    f,
+    initial_state: torch.Tensor,
+    states: torch.Tensor,
+    drivers: torch.Tensor,
+    quasi: bool = False,
+    damping: float = 0.0,
+    linearization_fn=None,
+):
+    if initial_state.ndim != 2:
+        raise ValueError(
+            "initial_state must have shape (B, D), got "
+            f"{tuple(initial_state.shape)}."
+        )
+
+    if states.ndim != 3:
+        raise ValueError(
+            "states must have shape (B, T, D), got "
+            f"{tuple(states.shape)}."
+        )
+
+    if drivers.ndim != 3:
+        raise ValueError(
+            "drivers must have shape (B, T, input_dim), got "
+            f"{tuple(drivers.shape)}."
+        )
+
+    batch_size, seq_len, state_dim = states.shape
+
+    if initial_state.shape != (batch_size, state_dim):
+        raise ValueError(
+            "initial_state must have shape (B, D), got "
+            f"{tuple(initial_state.shape)} for states shape {tuple(states.shape)}."
+        )
+
+    if drivers.shape[:2] != (batch_size, seq_len):
+        raise ValueError(
+            "drivers must share batch/time dimensions with states, got "
+            f"states={tuple(states.shape)} and drivers={tuple(drivers.shape)}."
+        )
+
+    if linearization_fn is not None:
+        previous_all = torch.cat(
+            [initial_state[:, None, :], states[:, :-1, :]],
+            dim=1,
+        )
+
+        predicted_all, J_all = linearization_fn(previous_all, drivers)
+
+        _elk_validate_linearization_shapes(
+            predicted=predicted_all,
+            jacobian=J_all,
+            previous_states=previous_all,
+        )
+
+        initial_mean = predicted_all[:, 0, :]
+
+        if seq_len == 1:
+            if quasi:
+                A = torch.empty(
+                    batch_size,
+                    0,
+                    state_dim,
+                    device=states.device,
+                    dtype=states.dtype,
+                )
+            else:
+                A = torch.empty(
+                    batch_size,
+                    0,
+                    state_dim,
+                    state_dim,
+                    device=states.device,
+                    dtype=states.dtype,
+                )
+
+            b = torch.empty(
+                batch_size,
+                0,
+                state_dim,
+                device=states.device,
+                dtype=states.dtype,
+            )
+
+            return initial_mean, A, b
+
+        fs = predicted_all[:, 1:, :]
+        Jfs = J_all[:, 1:]
+        previous_tail = states[:, :-1, :]
+
+        if quasi:
+            if Jfs.ndim == 3:
+                A = Jfs
+            elif Jfs.ndim == 4:
+                A = torch.diagonal(Jfs, dim1=-2, dim2=-1)
+            else:
+                raise ValueError(
+                    "For quasi-ELK, linearization_fn must return diagonal "
+                    "Jacobians with shape (B,T,D) or dense Jacobians with "
+                    f"shape (B,T,D,D). Got {tuple(Jfs.shape)}."
+                )
+
+            A = (1.0 - damping) * A
+            b = fs - A * previous_tail
+            return initial_mean, A, b
+
+        if Jfs.ndim != 4:
+            raise ValueError(
+                "Full ELK requires dense Jacobians with shape (B,T,D,D). "
+                f"Got {tuple(Jfs.shape)}."
+            )
+
+        A = (1.0 - damping) * Jfs
+        b = fs - torch.einsum("btij,btj->bti", A, previous_tail)
+
+        return initial_mean, A, b
+
+    initial_means = []
+    A_values = []
+    b_values = []
+
+    for batch_idx in range(batch_size):
+        initial_mean_i, A_i, b_i = _linearize_dynamics(
+            f=f,
+            initial_state=initial_state[batch_idx],
+            states=states[batch_idx],
+            drivers=drivers[batch_idx],
+            quasi=quasi,
+            damping=damping,
+        )
+        initial_means.append(initial_mean_i)
+        A_values.append(A_i)
+        b_values.append(b_i)
+
+    return (
+        torch.stack(initial_means, dim=0),
+        torch.stack(A_values, dim=0),
+        torch.stack(b_values, dim=0),
+    )
+
+
+def elk_step_batched(
+    f,
+    initial_state: torch.Tensor,
+    states: torch.Tensor,
+    drivers: torch.Tensor,
+    sigmasq: float = 1e8,
+    process_noise: float = 1.0,
+    quasi: bool = False,
+    damping: float = 0.0,
+    clip_value=None,
+    scan_backend: str = "torch",
+    accel_scan_fn=None,
+    linearization_fn=None,
+):
+    """One batched ELK or quasi-ELK iteration.
+
+    This wraps the existing single-sequence ELK filters over the batch
+    dimension while allowing structured cells to provide explicit
+    linearizations. For ParaGRU and scalar-quasi ParaRNN/LSTM, the Jacobian is
+    diagonal. For full ParaRNN, the Jacobian is dense.
+    """
+    batch_size, seq_len, _ = states.shape
+
+    if seq_len == 0:
+        return states.clone()
+
+    initial_mean, A, b = _elk_linearize_batched(
+        f=f,
+        initial_state=initial_state,
+        states=states,
+        drivers=drivers,
+        quasi=quasi,
+        damping=damping,
+        linearization_fn=linearization_fn,
+    )
+
+    outputs = []
+
+    for batch_idx in range(batch_size):
+        if quasi:
+            if scan_backend == "torch":
+                new_i = _diag_parallel_kalman_filter(
+                    initial_mean=initial_mean[batch_idx],
+                    A=A[batch_idx],
+                    b=b[batch_idx],
+                    emissions=states[batch_idx],
+                    sigmasq=sigmasq,
+                    process_noise=process_noise,
+                )
+            elif scan_backend == "accel_scan":
+                new_i = _diag_parallel_kalman_filter_accel_scan(
+                    initial_mean=initial_mean[batch_idx],
+                    A=A[batch_idx],
+                    b=b[batch_idx],
+                    emissions=states[batch_idx],
+                    sigmasq=sigmasq,
+                    process_noise=process_noise,
+                    accel_scan_fn=accel_scan_fn,
+                )
+            else:
+                raise ValueError(f"Unknown scan_backend: {scan_backend}")
+        else:
+            if scan_backend != "torch":
+                raise ValueError("Full dense ELK only supports scan_backend='torch'.")
+
+            new_i = _dense_parallel_kalman_filter(
+                initial_mean=initial_mean[batch_idx],
+                A=A[batch_idx],
+                b=b[batch_idx],
+                emissions=states[batch_idx],
+                sigmasq=sigmasq,
+                process_noise=process_noise,
+            )
+
+        outputs.append(new_i)
+
+    new_states = torch.stack(outputs, dim=0)
+
+    if clip_value is not None:
+        new_states = torch.clamp(new_states, -clip_value, clip_value)
+        new_states = torch.nan_to_num(new_states)
+
+    return new_states
+
+
+def elk_alg_batched(
+    f,
+    initial_state: torch.Tensor,
+    states_guess: torch.Tensor,
+    drivers: torch.Tensor,
+    sigmasq: float = 1e8,
+    process_noise: float = 1.0,
+    num_iters: int = 20,
+    tol=None,
+    quasi: bool = False,
+    damping: float = 0.0,
+    clip_value=None,
+    return_trace: bool = False,
+    scan_backend: str = "torch",
+    accel_scan_fn=None,
+    strict_tol: bool = False,
+    stopping_criterion: str = "update",
+    linearization_fn=None,
+):
+    """Batched ELK solver for h_t = f(h_{t-1}, u_t)."""
+    if stopping_criterion not in ("update", "merit"):
+        raise ValueError("stopping_criterion must be either 'update' or 'merit'.")
+
+    if initial_state.ndim != 2:
+        raise ValueError(
+            "initial_state must have shape (B, D), got "
+            f"{tuple(initial_state.shape)}."
+        )
+
+    if states_guess.ndim != 3:
+        raise ValueError(
+            "states_guess must have shape (B, T, D), got "
+            f"{tuple(states_guess.shape)}."
+        )
+
+    if drivers.ndim != 3:
+        raise ValueError(
+            "drivers must have shape (B, T, input_dim), got "
+            f"{tuple(drivers.shape)}."
+        )
+
+    batch_size, seq_len, state_dim = states_guess.shape
+
+    if initial_state.shape != (batch_size, state_dim):
+        raise ValueError(
+            "initial_state must have shape (B, D), got "
+            f"{tuple(initial_state.shape)} for states_guess shape "
+            f"{tuple(states_guess.shape)}."
+        )
+
+    if drivers.shape[:2] != (batch_size, seq_len):
+        raise ValueError(
+            "drivers must share batch/time dimensions with states_guess, got "
+            f"states_guess={tuple(states_guess.shape)} and drivers={tuple(drivers.shape)}."
+        )
+
+    states = states_guess.clone()
+
+    effective_tol = _effective_tol(
+        dtype=states.dtype,
+        tol=tol,
+        strict_tol=strict_tol,
+    )
+
+    trace = [states.clone()] if return_trace else None
+
+    initial_merit = merit_fxn_batched(f, initial_state, states, drivers)
+
+    num_steps_done = 0
+    last_update_error = torch.tensor(
+        float("inf"),
+        device=states.device,
+        dtype=states.dtype,
+    )
+
+    for it in range(num_iters):
+        if stopping_criterion == "merit":
+            current_merit = merit_fxn_batched(
+                f,
+                initial_state,
+                states,
+                drivers,
+            )
+
+            if current_merit.item() <= effective_tol:
+                break
+
+        old_states = states
+
+        new_states = elk_step_batched(
+            f=f,
+            initial_state=initial_state,
+            states=old_states,
+            drivers=drivers,
+            sigmasq=sigmasq,
+            process_noise=process_noise,
+            quasi=quasi,
+            damping=damping,
+            clip_value=clip_value,
+            scan_backend=scan_backend,
+            accel_scan_fn=accel_scan_fn,
+            linearization_fn=linearization_fn,
+        )
+
+        last_update_error = torch.max(torch.abs(new_states - old_states))
+
+        states = new_states
+        num_steps_done = it + 1
+
+        if return_trace:
+            trace.append(states.clone())
+
+        if stopping_criterion == "update":
+            if last_update_error.item() <= effective_tol:
+                break
+
+    final_merit = merit_fxn_batched(f, initial_state, states, drivers)
+
+    info = {
+        "num_iters": num_steps_done,
+        "initial_merit": initial_merit.detach(),
+        "final_merit": final_merit.detach(),
+        "last_update_error": last_update_error.detach(),
+        "tol": tol,
+        "effective_tol": effective_tol,
+        "strict_tol": strict_tol,
+        "stopping_criterion": stopping_criterion,
+        "sigmasq": sigmasq,
+        "process_noise": process_noise,
+        "quasi": quasi,
+        "scan_backend": scan_backend,
+        "solver": "elk",
+        "batched": True,
+        "batch_size": batch_size,
+        "linearization_backend": "custom" if linearization_fn is not None else "autograd",
+    }
+
+    if return_trace:
+        info["trace"] = torch.stack(trace, dim=0)
+
+    return states, info
+
+# === End batched ELK layer integration extension ===

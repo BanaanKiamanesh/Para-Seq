@@ -909,3 +909,234 @@ except Exception:
     pass
 
 # === End dense ParaRNN scalar quasi-DEER extension ===
+
+
+# === ParaRNN ELK layer API extension ===
+
+from src.algos.ELK import elk_alg_batched
+
+
+def make_pararnn_elk_config(
+    backend: str = "elk",
+    *,
+    num_iters: int = 8,
+    tol: float | None = None,
+    strict_tol: bool = False,
+    initial_guess: str = "f0",
+    scan_backend: str = "torch",
+    accel_module: str = "warp",
+    sigmasq: float = 1e8,
+    process_noise: float = 1.0,
+) -> DeerNewtonConfig:
+    """Construct an ELK config for dense vanilla ParaRNN.
+
+    Backends:
+        elk / full_elk / dense_elk:
+            full dense ELK with dense recurrent Jacobians.
+
+        quasi_elk / scalar_quasi_elk:
+            scalar quasi-ELK using only diag(J_t).
+    """
+    if backend in ("elk", "full_elk", "dense_elk"):
+        if scan_backend != "torch":
+            raise ValueError("Full dense ParaRNN ELK supports scan_backend='torch' only.")
+
+        cfg = DeerNewtonConfig(
+            num_iters=num_iters,
+            tol=tol,
+            strict_tol=strict_tol,
+            stopping_criterion="update",
+            initial_guess=initial_guess,  # type: ignore[arg-type]
+            quasi=False,
+            scan_backend="torch",
+            accel_module=accel_module,
+            jacobian_backend="explicit",
+            backward_backend="autograd",
+        )
+        cfg.solver = "elk"
+        cfg.sigmasq = float(sigmasq)
+        cfg.process_noise = float(process_noise)
+        cfg.pararnn_elk_kind = "full_dense"
+        return cfg
+
+    if backend in ("quasi_elk", "scalar_quasi_elk", "quasi"):
+        if scan_backend not in ("torch", "accel_scan"):
+            raise ValueError("ParaRNN quasi-ELK scan_backend must be 'torch' or 'accel_scan'.")
+
+        cfg = DeerNewtonConfig(
+            num_iters=num_iters,
+            tol=tol,
+            strict_tol=strict_tol,
+            stopping_criterion="update",
+            initial_guess=initial_guess,  # type: ignore[arg-type]
+            quasi=True,
+            scan_backend=scan_backend,
+            accel_module=accel_module,
+            jacobian_backend="explicit",
+            backward_backend="autograd",
+        )
+        cfg.solver = "elk"
+        cfg.sigmasq = float(sigmasq)
+        cfg.process_noise = float(process_noise)
+        cfg.pararnn_elk_kind = "scalar_quasi"
+        return cfg
+
+    raise ValueError(
+        f"Unknown ParaRNN ELK backend {backend!r}. Expected 'elk', "
+        "'full_elk', 'dense_elk', 'quasi_elk', or 'scalar_quasi_elk'."
+    )
+
+
+def _pararnn_make_elk_linearization_fn(self, cfg: DeerNewtonConfig):
+    if getattr(cfg, "jacobian_backend", "explicit") != "explicit":
+        return None
+
+    if cfg.quasi:
+        return self.compute_linearization_diag_from_previous
+
+    return self.cell.compute_linearization_dense_from_previous
+
+
+def _pararnn_forward_elk(
+    self,
+    x: torch.Tensor,
+    initial_state: torch.Tensor | None = None,
+    elk_config: DeerNewtonConfig | None = None,
+) -> torch.Tensor:
+    cfg = self.config.deer if elk_config is None else elk_config
+
+    x_batched, had_batch_dim = self._normalize_input(x)
+    initial_state_batched = self._normalize_initial_state(
+        x_batched=x_batched,
+        initial_state=initial_state,
+    )
+
+    states_guess = self.assemble_initial_guess_batched(
+        drivers=x_batched,
+        initial_state=initial_state_batched,
+        guess_type=cfg.initial_guess,
+    )
+
+    accel_scan_fn = self._load_accel_scan_if_needed(cfg)
+    linearization_fn = self._make_elk_linearization_fn(cfg)
+
+    states, info = elk_alg_batched(
+        f=self.recurrence_step,
+        initial_state=initial_state_batched,
+        states_guess=states_guess,
+        drivers=x_batched,
+        sigmasq=getattr(cfg, "sigmasq", 1e8),
+        process_noise=getattr(cfg, "process_noise", 1.0),
+        num_iters=cfg.num_iters,
+        tol=cfg.tol,
+        quasi=cfg.quasi,
+        damping=cfg.damping,
+        clip_value=cfg.clip_value,
+        return_trace=cfg.return_trace,
+        scan_backend=cfg.scan_backend,
+        accel_scan_fn=accel_scan_fn,
+        strict_tol=cfg.strict_tol,
+        stopping_criterion=cfg.stopping_criterion,
+        linearization_fn=linearization_fn,
+    )
+
+    info = dict(info)
+    info["jacobian_backend"] = "explicit_diag_from_dense" if cfg.quasi else "explicit_dense"
+    info["linearization_backend"] = "custom_diag_from_dense" if cfg.quasi else "custom_dense"
+    info["backward_backend"] = "autograd"
+    info["cell_variant"] = (
+        f"dense_vanilla_{self.nonlinearity}_quasi_elk"
+        if cfg.quasi
+        else f"dense_vanilla_{self.nonlinearity}_full_elk"
+    )
+    info["pararnn_elk_kind"] = getattr(cfg, "pararnn_elk_kind", None)
+    self.last_deer_infos = [info]
+
+    outputs = self.post_process(states)
+
+    return self._restore_output_layout(
+        outputs,
+        had_batch_dim=had_batch_dim,
+    )
+
+
+_ParaRNN_init_before_elk = ParaRNN.__init__
+
+
+def _pararnn_init_with_elk(
+    self,
+    *args,
+    solver: str = "deer",
+    elk_sigmasq: float = 1e8,
+    elk_process_noise: float = 1.0,
+    **kwargs,
+):
+    if solver in ("elk", "full_elk", "dense_elk", "quasi_elk", "scalar_quasi_elk"):
+        requested_mode = kwargs.get("mode", None)
+        if requested_mode is None or requested_mode == "deer":
+            kwargs["mode"] = "elk"
+
+        if solver in ("quasi_elk", "scalar_quasi_elk"):
+            elk_backend = "quasi_elk"
+        else:
+            elk_backend = kwargs.get("backend", "elk")
+            if elk_backend not in ("quasi_elk", "scalar_quasi_elk", "quasi"):
+                elk_backend = "elk"
+
+        if kwargs.get("deer_config", None) is None:
+            kwargs["deer_config"] = make_pararnn_elk_config(
+                backend=elk_backend,
+                num_iters=kwargs.get("num_iters", 8),
+                tol=kwargs.get("tol", None),
+                strict_tol=kwargs.get("strict_tol", False),
+                scan_backend=kwargs.get("scan_backend", "torch"),
+                accel_module=kwargs.get("accel_module", "warp"),
+                sigmasq=elk_sigmasq,
+                process_noise=elk_process_noise,
+            )
+        else:
+            cfg = kwargs["deer_config"]
+            cfg.solver = "elk"
+            cfg.sigmasq = float(elk_sigmasq)
+            cfg.process_noise = float(elk_process_noise)
+
+        _ParaRNN_init_before_elk(self, *args, **kwargs)
+        self.solver = "elk"
+        return
+
+    _ParaRNN_init_before_elk(self, *args, **kwargs)
+    self.solver = getattr(self.config.deer, "solver", "deer")
+
+
+_ParaRNN_forward_before_elk = ParaRNN.forward
+
+
+def _pararnn_forward_with_elk(
+    self,
+    input: torch.Tensor,
+    hx: torch.Tensor | None = None,
+    *,
+    mode: Literal["sequential", "deer", "elk"] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    selected_mode = self.mode if mode is None else mode
+
+    if selected_mode == "elk":
+        initial_state, unbatched_input = self._hx_to_initial_state(input, hx)
+        output = self.forward_elk(input, initial_state=initial_state)
+        h_n = self._make_h_n(output, unbatched_input=unbatched_input)
+        return output, h_n
+
+    return _ParaRNN_forward_before_elk(
+        self,
+        input=input,
+        hx=hx,
+        mode=mode,
+    )
+
+
+ParaRNN._make_elk_linearization_fn = _pararnn_make_elk_linearization_fn
+ParaRNN.forward_elk = _pararnn_forward_elk
+ParaRNN.__init__ = _pararnn_init_with_elk
+ParaRNN.forward = _pararnn_forward_with_elk
+
+# === End ParaRNN ELK layer API extension ===
