@@ -803,3 +803,331 @@ ParaGRU.__init__ = _part5_paragru_init
 ParaGRU.forward = _part5_paragru_forward
 
 # === End Part-5 fix: native ELK/adjoint compatibility ===
+
+
+# === Unified algorithm mode support ===
+
+def _all_algos_make_fixed_config(
+    solver: str,
+    *,
+    num_iters: int = 20,
+    tol: float | None = None,
+    strict_tol: bool = False,
+    initial_guess: str = "f0",
+) -> DeerNewtonConfig:
+    if solver not in ("jacobi", "picard"):
+        raise ValueError("solver must be 'jacobi' or 'picard'.")
+
+    cfg = DeerNewtonConfig(
+        num_iters=num_iters,
+        tol=tol,
+        strict_tol=strict_tol,
+        stopping_criterion="merit",
+        initial_guess=initial_guess,  # type: ignore[arg-type]
+        quasi=False,
+        scan_backend="torch",
+        accel_module="warp",
+    )
+    cfg.solver = solver
+    cfg.jacobian_backend = "none"
+    cfg.backward_backend = "autograd"
+    return cfg
+
+
+def make_paragru_jacobi_config(
+    *,
+    num_iters: int = 20,
+    tol: float | None = None,
+    strict_tol: bool = False,
+    initial_guess: str = "f0",
+) -> DeerNewtonConfig:
+    return _all_algos_make_fixed_config(
+        "jacobi",
+        num_iters=num_iters,
+        tol=tol,
+        strict_tol=strict_tol,
+        initial_guess=initial_guess,
+    )
+
+
+def make_paragru_picard_config(
+    *,
+    num_iters: int = 20,
+    tol: float | None = None,
+    strict_tol: bool = False,
+    initial_guess: str = "f0",
+) -> DeerNewtonConfig:
+    return _all_algos_make_fixed_config(
+        "picard",
+        num_iters=num_iters,
+        tol=tol,
+        strict_tol=strict_tol,
+        initial_guess=initial_guess,
+    )
+
+
+if not hasattr(ParaGRU, "_all_algos_previous_make_deer_config"):
+    _all_algos_previous_make_paragru_deer_config = make_paragru_deer_config
+else:
+    _all_algos_previous_make_paragru_deer_config = ParaGRU._all_algos_previous_make_deer_config
+
+
+def make_paragru_deer_config(
+    backend: str = "adjoint",
+    *,
+    num_iters: int = 4,
+    tol: float | None = None,
+    strict_tol: bool = False,
+    initial_guess: str = "f0",
+    scan_backend: Literal["torch", "accel_scan"] = "torch",
+    accel_module: str = "warp",
+) -> DeerNewtonConfig:
+    if backend in ("quasi", "quasi_adjoint", "quasi_deer_adjoint_torch"):
+        backend = "adjoint"
+        scan_backend = "torch"
+    elif backend == "quasi_deer_adjoint_accel_scan":
+        backend = "adjoint"
+        scan_backend = "accel_scan"
+    elif backend in ("quasi_autograd", "quasi_deer_autograd_torch"):
+        backend = "autograd"
+        scan_backend = "torch"
+    elif backend == "quasi_deer_autograd_accel_scan":
+        backend = "autograd"
+        scan_backend = "accel_scan"
+
+    cfg = _all_algos_previous_make_paragru_deer_config(
+        backend=backend,
+        num_iters=num_iters,
+        tol=tol,
+        strict_tol=strict_tol,
+        initial_guess=initial_guess,
+        scan_backend=scan_backend,
+        accel_module=accel_module,
+    )
+    cfg.solver = "deer"
+    return cfg
+
+
+ParaGRU._all_algos_previous_make_deer_config = _all_algos_previous_make_paragru_deer_config
+
+
+if not hasattr(ParaGRU, "_all_algos_previous_init"):
+    ParaGRU._all_algos_previous_init = ParaGRU.__init__
+
+
+def _all_algos_paragru_init(
+    self,
+    *args,
+    solver: str = "deer",
+    **kwargs,
+):
+    if solver in ("jacobi", "picard"):
+        if kwargs.get("deer_config", None) is None:
+            if solver == "jacobi":
+                kwargs["deer_config"] = make_paragru_jacobi_config(
+                    num_iters=kwargs.get("num_iters", 20),
+                    tol=kwargs.get("tol", None),
+                    strict_tol=kwargs.get("strict_tol", False),
+                )
+            else:
+                kwargs["deer_config"] = make_paragru_picard_config(
+                    num_iters=kwargs.get("num_iters", 20),
+                    tol=kwargs.get("tol", None),
+                    strict_tol=kwargs.get("strict_tol", False),
+                )
+
+        if "mode" not in kwargs:
+            kwargs["mode"] = solver
+
+        ParaGRU._all_algos_previous_init(self, *args, solver="deer", **kwargs)
+        self.solver = solver
+        self.mode = kwargs["mode"]
+        self.config.mode = self.mode
+        return
+
+    ParaGRU._all_algos_previous_init(self, *args, solver=solver, **kwargs)
+
+
+if not hasattr(ParaGRU, "_all_algos_previous_forward"):
+    ParaGRU._all_algos_previous_forward = ParaGRU.forward
+
+
+def _all_algos_paragru_forward(
+    self,
+    input: torch.Tensor,
+    hx: torch.Tensor | None = None,
+    *,
+    mode=None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    selected_mode = self.mode if mode is None else mode
+
+    if selected_mode not in ("jacobi", "picard"):
+        return ParaGRU._all_algos_previous_forward(
+            self,
+            input,
+            hx,
+            mode=mode,
+        )
+
+    initial_state, unbatched_input = self._hx_to_initial_state(input, hx)
+
+    if selected_mode == "jacobi":
+        output = self.forward_jacobi(input, initial_state=initial_state)
+    else:
+        output = self.forward_picard(input, initial_state=initial_state)
+
+    h_n = self._make_h_n(output, unbatched_input=unbatched_input)
+    return output, h_n
+
+
+ParaGRU.__init__ = _all_algos_paragru_init
+ParaGRU.forward = _all_algos_paragru_forward
+
+# === End unified algorithm mode support ===
+
+# === Fixed-point accel_scan support ===
+
+def _fp_accel_make_paragru_fixed_config(
+    solver: str,
+    *,
+    num_iters: int = 20,
+    tol: float | None = None,
+    strict_tol: bool = False,
+    initial_guess: str = "f0",
+    scan_backend: Literal["torch", "accel_scan"] = "torch",
+    accel_module: str = "warp",
+) -> DeerNewtonConfig:
+    if solver not in ("jacobi", "picard"):
+        raise ValueError("solver must be 'jacobi' or 'picard'.")
+    if scan_backend not in ("torch", "accel_scan"):
+        raise ValueError("scan_backend must be 'torch' or 'accel_scan'.")
+
+    cfg = DeerNewtonConfig(
+        num_iters=num_iters,
+        tol=tol,
+        strict_tol=strict_tol,
+        stopping_criterion="merit",
+        initial_guess=initial_guess,  # type: ignore[arg-type]
+        quasi=False,
+        scan_backend=scan_backend,
+        accel_module=accel_module,
+    )
+    cfg.solver = solver
+    cfg.jacobian_backend = "none"
+    cfg.backward_backend = "autograd"
+    return cfg
+
+
+def make_paragru_jacobi_config(
+    *,
+    num_iters: int = 20,
+    tol: float | None = None,
+    strict_tol: bool = False,
+    initial_guess: str = "f0",
+    scan_backend: Literal["torch", "accel_scan"] = "torch",
+    accel_module: str = "warp",
+) -> DeerNewtonConfig:
+    return _fp_accel_make_paragru_fixed_config(
+        "jacobi",
+        num_iters=num_iters,
+        tol=tol,
+        strict_tol=strict_tol,
+        initial_guess=initial_guess,
+        scan_backend=scan_backend,
+        accel_module=accel_module,
+    )
+
+
+def make_paragru_picard_config(
+    *,
+    num_iters: int = 20,
+    tol: float | None = None,
+    strict_tol: bool = False,
+    initial_guess: str = "f0",
+    scan_backend: Literal["torch", "accel_scan"] = "torch",
+    accel_module: str = "warp",
+) -> DeerNewtonConfig:
+    return _fp_accel_make_paragru_fixed_config(
+        "picard",
+        num_iters=num_iters,
+        tol=tol,
+        strict_tol=strict_tol,
+        initial_guess=initial_guess,
+        scan_backend=scan_backend,
+        accel_module=accel_module,
+    )
+
+
+if not hasattr(ParaGRU, "_fp_accel_previous_init"):
+    ParaGRU._fp_accel_previous_init = ParaGRU.__init__
+
+
+def _fp_accel_paragru_init(
+    self,
+    *args,
+    solver: str = "deer",
+    **kwargs,
+):
+    if solver in ("jacobi", "picard"):
+        if kwargs.get("deer_config", None) is None:
+            helper = make_paragru_jacobi_config if solver == "jacobi" else make_paragru_picard_config
+            kwargs["deer_config"] = helper(
+                num_iters=kwargs.get("num_iters", 20),
+                tol=kwargs.get("tol", None),
+                strict_tol=kwargs.get("strict_tol", False),
+                scan_backend=kwargs.get("scan_backend", "torch"),
+                accel_module=kwargs.get("accel_module", "warp"),
+            )
+
+        if "mode" not in kwargs:
+            kwargs["mode"] = solver
+
+        ParaGRU._fp_accel_previous_init(self, *args, solver="deer", **kwargs)
+        self.solver = solver
+        self.mode = kwargs["mode"]
+        self.config.mode = self.mode
+        return
+
+    ParaGRU._fp_accel_previous_init(self, *args, solver=solver, **kwargs)
+
+
+ParaGRU.__init__ = _fp_accel_paragru_init
+
+# === End fixed-point accel_scan support ===
+
+
+# === Accel fixed-point constructor and public forward final fix ===
+
+def _accel_final_paragru_forward(
+    self,
+    input: torch.Tensor,
+    hx: torch.Tensor | None = None,
+    *,
+    mode=None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    initial_state, unbatched_input = self._hx_to_initial_state(input, hx)
+    selected_mode = self.mode if mode is None else mode
+
+    if selected_mode == "sequential":
+        output = self.forward_sequential(input, initial_state=initial_state)
+    elif selected_mode == "deer":
+        output = self.forward_deer(input, initial_state=initial_state)
+    elif selected_mode == "elk":
+        output = self.forward_elk(input, initial_state=initial_state)
+    elif selected_mode == "jacobi":
+        output = self.forward_jacobi(input, initial_state=initial_state)
+    elif selected_mode == "picard":
+        output = self.forward_picard(input, initial_state=initial_state)
+    else:
+        raise ValueError(
+            f"Unknown mode {selected_mode!r}. "
+            "Expected 'sequential', 'deer', 'elk', 'jacobi', or 'picard'."
+        )
+
+    h_n = self._make_h_n(output, unbatched_input=unbatched_input)
+    return output, h_n
+
+
+ParaGRU.forward = _accel_final_paragru_forward
+
+# === End accel fixed-point constructor and public forward final fix ===

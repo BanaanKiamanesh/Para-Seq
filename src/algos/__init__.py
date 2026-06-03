@@ -24,3 +24,27 @@ from src.algos.ELK import (
     elk_alg,
     elk_step,
 )
+
+
+# === Unified algorithm mode exports ===
+from src.algos.FixedPoint import (
+    fixed_point_step_batched,
+    fixed_point_alg_batched,
+    jacobi_alg_batched,
+    picard_alg_batched,
+)
+
+try:
+    __all__
+except NameError:
+    __all__ = []
+
+for _name in [
+    "fixed_point_step_batched",
+    "fixed_point_alg_batched",
+    "jacobi_alg_batched",
+    "picard_alg_batched",
+]:
+    if _name not in __all__:
+        __all__.append(_name)
+# === End unified algorithm mode exports ===

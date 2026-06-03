@@ -1771,3 +1771,388 @@ ParaLSTM.forward_elk_states = _part5_paralstm_forward_elk_states
 ParaLSTM.forward = _part5_paralstm_forward
 
 # === End Part-5 fix: native ELK/adjoint compatibility ===
+
+
+# === Unified algorithm mode support ===
+
+def _all_algos_make_fixed_config(
+    solver: str,
+    *,
+    num_iters: int = 20,
+    tol: float | None = None,
+    strict_tol: bool = False,
+    initial_guess: str = "f0",
+) -> DeerNewtonConfig:
+    if solver not in ("jacobi", "picard"):
+        raise ValueError("solver must be 'jacobi' or 'picard'.")
+
+    cfg = DeerNewtonConfig(
+        num_iters=num_iters,
+        tol=tol,
+        strict_tol=strict_tol,
+        stopping_criterion="merit",
+        initial_guess=initial_guess,  # type: ignore[arg-type]
+        quasi=False,
+        scan_backend="torch",
+        accel_module="warp",
+    )
+    cfg.solver = solver
+    cfg.jacobian_backend = "none"
+    cfg.backward_backend = "autograd"
+    return cfg
+
+
+def make_paralstm_jacobi_config(
+    *,
+    num_iters: int = 20,
+    tol: float | None = None,
+    strict_tol: bool = False,
+    initial_guess: str = "f0",
+) -> DeerNewtonConfig:
+    return _all_algos_make_fixed_config(
+        "jacobi",
+        num_iters=num_iters,
+        tol=tol,
+        strict_tol=strict_tol,
+        initial_guess=initial_guess,
+    )
+
+
+def make_paralstm_picard_config(
+    *,
+    num_iters: int = 20,
+    tol: float | None = None,
+    strict_tol: bool = False,
+    initial_guess: str = "f0",
+) -> DeerNewtonConfig:
+    return _all_algos_make_fixed_config(
+        "picard",
+        num_iters=num_iters,
+        tol=tol,
+        strict_tol=strict_tol,
+        initial_guess=initial_guess,
+    )
+
+
+if not hasattr(ParaLSTM, "_all_algos_previous_init"):
+    ParaLSTM._all_algos_previous_init = ParaLSTM.__init__
+
+
+def _all_algos_paralstm_init(
+    self,
+    *args,
+    solver: str = "deer",
+    **kwargs,
+):
+    if solver in ("jacobi", "picard"):
+        if kwargs.get("deer_config", None) is None:
+            if solver == "jacobi":
+                kwargs["deer_config"] = make_paralstm_jacobi_config(
+                    num_iters=kwargs.get("num_iters", 20),
+                    tol=kwargs.get("tol", None),
+                    strict_tol=kwargs.get("strict_tol", False),
+                )
+            else:
+                kwargs["deer_config"] = make_paralstm_picard_config(
+                    num_iters=kwargs.get("num_iters", 20),
+                    tol=kwargs.get("tol", None),
+                    strict_tol=kwargs.get("strict_tol", False),
+                )
+
+        if "mode" not in kwargs:
+            kwargs["mode"] = solver
+
+        ParaLSTM._all_algos_previous_init(self, *args, solver="deer", **kwargs)
+        self.solver = solver
+        self.mode = kwargs["mode"]
+        self.config.mode = self.mode
+        return
+
+    ParaLSTM._all_algos_previous_init(self, *args, solver=solver, **kwargs)
+
+
+if not hasattr(ParaLSTM, "_all_algos_previous_forward"):
+    ParaLSTM._all_algos_previous_forward = ParaLSTM.forward
+
+
+def _all_algos_paralstm_forward(
+    self,
+    input: torch.Tensor,
+    hx: tuple[torch.Tensor, torch.Tensor] | None = None,
+    *,
+    mode=None,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    selected_mode = self.mode if mode is None else mode
+
+    if selected_mode not in ("jacobi", "picard"):
+        return ParaLSTM._all_algos_previous_forward(
+            self,
+            input,
+            hx,
+            mode=mode,
+        )
+
+    x_batched, had_batch_dim = self._normalize_input(input)
+    unbatched_input = not had_batch_dim
+
+    initial_state = self._normalize_lstm_hx(
+        x_batched=x_batched,
+        hx=hx,
+        unbatched_input=unbatched_input,
+    )
+
+    states = self.forward_fixed_point_states(
+        x_batched=x_batched,
+        initial_state_batched=initial_state,
+        method=selected_mode,
+        fixed_config=self.config.deer,
+    )
+
+    outputs_batched = self.post_process(states)
+    output = self._restore_output_layout(
+        outputs_batched,
+        had_batch_dim=had_batch_dim,
+    )
+    h_n, c_n = self._make_h_c_n(states, unbatched_input=unbatched_input)
+
+    return output, (h_n, c_n)
+
+
+ParaLSTM.__init__ = _all_algos_paralstm_init
+ParaLSTM.forward = _all_algos_paralstm_forward
+
+# === End unified algorithm mode support ===
+
+# === Fixed-point accel_scan support ===
+
+def _fp_accel_make_paralstm_fixed_config(
+    solver: str,
+    *,
+    num_iters: int = 20,
+    tol: float | None = None,
+    strict_tol: bool = False,
+    initial_guess: str = "f0",
+    scan_backend: Literal["torch", "accel_scan"] = "torch",
+    accel_module: str = "warp",
+) -> DeerNewtonConfig:
+    if solver not in ("jacobi", "picard"):
+        raise ValueError("solver must be 'jacobi' or 'picard'.")
+    if scan_backend not in ("torch", "accel_scan"):
+        raise ValueError("scan_backend must be 'torch' or 'accel_scan'.")
+
+    cfg = DeerNewtonConfig(
+        num_iters=num_iters,
+        tol=tol,
+        strict_tol=strict_tol,
+        stopping_criterion="merit",
+        initial_guess=initial_guess,  # type: ignore[arg-type]
+        quasi=False,
+        scan_backend=scan_backend,
+        accel_module=accel_module,
+    )
+    cfg.solver = solver
+    cfg.jacobian_backend = "none"
+    cfg.backward_backend = "autograd"
+    return cfg
+
+
+def make_paralstm_jacobi_config(
+    *,
+    num_iters: int = 20,
+    tol: float | None = None,
+    strict_tol: bool = False,
+    initial_guess: str = "f0",
+    scan_backend: Literal["torch", "accel_scan"] = "torch",
+    accel_module: str = "warp",
+) -> DeerNewtonConfig:
+    return _fp_accel_make_paralstm_fixed_config(
+        "jacobi",
+        num_iters=num_iters,
+        tol=tol,
+        strict_tol=strict_tol,
+        initial_guess=initial_guess,
+        scan_backend=scan_backend,
+        accel_module=accel_module,
+    )
+
+
+def make_paralstm_picard_config(
+    *,
+    num_iters: int = 20,
+    tol: float | None = None,
+    strict_tol: bool = False,
+    initial_guess: str = "f0",
+    scan_backend: Literal["torch", "accel_scan"] = "torch",
+    accel_module: str = "warp",
+) -> DeerNewtonConfig:
+    return _fp_accel_make_paralstm_fixed_config(
+        "picard",
+        num_iters=num_iters,
+        tol=tol,
+        strict_tol=strict_tol,
+        initial_guess=initial_guess,
+        scan_backend=scan_backend,
+        accel_module=accel_module,
+    )
+
+
+if not hasattr(ParaLSTM, "_fp_accel_previous_init"):
+    ParaLSTM._fp_accel_previous_init = ParaLSTM.__init__
+
+
+def _fp_accel_paralstm_init(
+    self,
+    *args,
+    solver: str = "deer",
+    **kwargs,
+):
+    if solver in ("jacobi", "picard"):
+        if kwargs.get("deer_config", None) is None:
+            helper = make_paralstm_jacobi_config if solver == "jacobi" else make_paralstm_picard_config
+            kwargs["deer_config"] = helper(
+                num_iters=kwargs.get("num_iters", 20),
+                tol=kwargs.get("tol", None),
+                strict_tol=kwargs.get("strict_tol", False),
+                scan_backend=kwargs.get("scan_backend", "torch"),
+                accel_module=kwargs.get("accel_module", "warp"),
+            )
+
+        if "mode" not in kwargs:
+            kwargs["mode"] = solver
+
+        ParaLSTM._fp_accel_previous_init(self, *args, solver="deer", **kwargs)
+        self.solver = solver
+        self.mode = kwargs["mode"]
+        self.config.mode = self.mode
+        return
+
+    ParaLSTM._fp_accel_previous_init(self, *args, solver=solver, **kwargs)
+
+
+ParaLSTM.__init__ = _fp_accel_paralstm_init
+
+# === End fixed-point accel_scan support ===
+
+
+# === Accel fixed-point constructor and public forward final fix ===
+
+if not hasattr(ParaLSTM, "_accel_final_original_init"):
+    if hasattr(ParaLSTM, "_part5_original_init"):
+        ParaLSTM._accel_final_original_init = ParaLSTM._part5_original_init
+    else:
+        ParaLSTM._accel_final_original_init = ParaLSTM.__init__
+
+
+if not hasattr(ParaLSTM, "_accel_final_delegate_init"):
+    ParaLSTM._accel_final_delegate_init = ParaLSTM.__init__
+
+
+def _accel_final_paralstm_init(
+    self,
+    *args,
+    solver: str = "deer",
+    **kwargs,
+):
+    if solver in ("jacobi", "picard"):
+        accel_module = kwargs.pop("accel_module", "warp")
+        scan_backend = kwargs.get("scan_backend", "torch")
+
+        if kwargs.get("deer_config", None) is None:
+            helper = (
+                make_paralstm_jacobi_config
+                if solver == "jacobi"
+                else make_paralstm_picard_config
+            )
+            kwargs["deer_config"] = helper(
+                num_iters=kwargs.get("num_iters", 20),
+                tol=kwargs.get("tol", None),
+                strict_tol=kwargs.get("strict_tol", False),
+                initial_guess=kwargs.get("initial_guess", "f0"),
+                scan_backend=scan_backend,
+                accel_module=accel_module,
+            )
+
+        if "mode" not in kwargs:
+            kwargs["mode"] = solver
+
+        ParaLSTM._accel_final_original_init(self, *args, **kwargs)
+
+        self.solver = solver
+        self.mode = kwargs["mode"]
+        self.config.mode = self.mode
+        return
+
+    # ParaLSTM's native constructor does not accept accel_module.
+    if "accel_module" in kwargs and kwargs.get("deer_config", None) is not None:
+        kwargs.pop("accel_module", None)
+
+    ParaLSTM._accel_final_delegate_init(self, *args, solver=solver, **kwargs)
+
+
+def _accel_final_paralstm_forward(
+    self,
+    input: torch.Tensor,
+    hx: tuple[torch.Tensor, torch.Tensor] | None = None,
+    *,
+    mode=None,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    x_batched, had_batch_dim = self._normalize_input(input)
+    unbatched_input = not had_batch_dim
+
+    initial_state = self._normalize_lstm_hx(
+        x_batched=x_batched,
+        hx=hx,
+        unbatched_input=unbatched_input,
+    )
+
+    selected_mode = self.mode if mode is None else mode
+
+    if selected_mode == "sequential":
+        states = self.batched_sequential_rollout(
+            initial_state=initial_state,
+            drivers=x_batched,
+        )
+    elif selected_mode == "deer":
+        states = self.forward_deer_states(
+            x_batched=x_batched,
+            initial_state=initial_state,
+            deer_config=self.config.deer,
+        )
+    elif selected_mode == "elk":
+        if not hasattr(self, "forward_elk_states"):
+            raise ValueError("ParaLSTM mode='elk' requires forward_elk_states.")
+        states = self.forward_elk_states(
+            x_batched=x_batched,
+            initial_state=initial_state,
+            elk_config=self.config.deer,
+        )
+    elif selected_mode in ("jacobi", "picard"):
+        states = self.forward_fixed_point_states(
+            x_batched=x_batched,
+            initial_state_batched=initial_state,
+            method=selected_mode,
+            fixed_config=self.config.deer,
+        )
+    else:
+        raise ValueError(
+            f"Unknown mode {selected_mode!r}. "
+            "Expected 'sequential', 'deer', 'elk', 'jacobi', or 'picard'."
+        )
+
+    outputs_batched = self.post_process(states)
+    output = self._restore_output_layout(
+        outputs_batched,
+        had_batch_dim=had_batch_dim,
+    )
+    h_n, c_n = self._make_h_c_n(
+        states,
+        unbatched_input=unbatched_input,
+    )
+
+    return output, (h_n, c_n)
+
+
+ParaLSTM.__init__ = _accel_final_paralstm_init
+ParaLSTM.forward = _accel_final_paralstm_forward
+
+# === End accel fixed-point constructor and public forward final fix ===

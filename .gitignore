@@ -10,7 +10,6 @@ venv/
 
 notebooks/data/
 
-test/bench/logs/*.csv
-test/bench/logs/*.log
-
 *.py.bak.*
+*backup*
+*.accel_*

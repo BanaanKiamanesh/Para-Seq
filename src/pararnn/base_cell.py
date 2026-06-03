@@ -741,3 +741,205 @@ BaseParaRNNCell._make_elk_linearization_fn = _native_base_make_elk_linearization
 BaseParaRNNCell.forward_elk = _native_base_forward_elk
 
 # === End native BaseParaRNNCell ELK methods ===
+
+
+# === Unified algorithm mode support ===
+
+from src.algos.FixedPoint import fixed_point_alg_batched as _all_algos_fixed_point_alg_batched
+
+
+def _all_algos_forward_fixed_point_states(
+    self,
+    x_batched: torch.Tensor,
+    initial_state_batched: torch.Tensor,
+    *,
+    method: str,
+    fixed_config: Optional[DeerNewtonConfig] = None,
+) -> torch.Tensor:
+    if method not in ("jacobi", "picard"):
+        raise ValueError("method must be 'jacobi' or 'picard'.")
+
+    cfg = self.config.deer if fixed_config is None else fixed_config
+
+    states_guess = self.assemble_initial_guess_batched(
+        drivers=x_batched,
+        initial_state=initial_state_batched,
+        guess_type=getattr(cfg, "initial_guess", "f0"),
+    )
+
+    states, info = _all_algos_fixed_point_alg_batched(
+        f=self.recurrence_step,
+        initial_state=initial_state_batched,
+        states_guess=states_guess,
+        drivers=x_batched,
+        method=method,
+        num_iters=getattr(cfg, "num_iters", 20),
+        tol=getattr(cfg, "tol", None),
+        clip_value=getattr(cfg, "clip_value", None),
+        return_trace=getattr(cfg, "return_trace", False),
+        strict_tol=getattr(cfg, "strict_tol", False),
+        stopping_criterion=getattr(cfg, "stopping_criterion", "merit"),
+    )
+
+    info = dict(info)
+    info["solver"] = method
+    info["backward_backend"] = "autograd"
+    self.last_deer_infos = [info]
+
+    return states
+
+
+def _all_algos_forward_fixed_point(
+    self,
+    x: torch.Tensor,
+    initial_state: Optional[torch.Tensor] = None,
+    *,
+    method: str,
+    fixed_config: Optional[DeerNewtonConfig] = None,
+) -> torch.Tensor:
+    x_batched, had_batch_dim = self._normalize_input(x)
+    initial_state_batched = self._normalize_initial_state(
+        x_batched=x_batched,
+        initial_state=initial_state,
+    )
+
+    states = self.forward_fixed_point_states(
+        x_batched=x_batched,
+        initial_state_batched=initial_state_batched,
+        method=method,
+        fixed_config=fixed_config,
+    )
+
+    outputs = self.post_process(states)
+
+    return self._restore_output_layout(
+        outputs,
+        had_batch_dim=had_batch_dim,
+    )
+
+
+def _all_algos_forward_jacobi(
+    self,
+    x: torch.Tensor,
+    initial_state: Optional[torch.Tensor] = None,
+    fixed_config: Optional[DeerNewtonConfig] = None,
+) -> torch.Tensor:
+    return self.forward_fixed_point(
+        x=x,
+        initial_state=initial_state,
+        method="jacobi",
+        fixed_config=fixed_config,
+    )
+
+
+def _all_algos_forward_picard(
+    self,
+    x: torch.Tensor,
+    initial_state: Optional[torch.Tensor] = None,
+    fixed_config: Optional[DeerNewtonConfig] = None,
+) -> torch.Tensor:
+    return self.forward_fixed_point(
+        x=x,
+        initial_state=initial_state,
+        method="picard",
+        fixed_config=fixed_config,
+    )
+
+
+if not hasattr(BaseParaRNNCell, "_all_algos_previous_forward"):
+    BaseParaRNNCell._all_algos_previous_forward = BaseParaRNNCell.forward
+
+
+def _all_algos_base_forward(
+    self,
+    x: torch.Tensor,
+    initial_state: Optional[torch.Tensor] = None,
+    mode: Optional[str] = None,
+) -> torch.Tensor:
+    selected_mode = self.mode if mode is None else mode
+
+    if selected_mode == "sequential":
+        return self.forward_sequential(x=x, initial_state=initial_state)
+
+    if selected_mode == "deer":
+        return self.forward_deer(x=x, initial_state=initial_state)
+
+    if selected_mode == "elk":
+        if not hasattr(self, "forward_elk"):
+            raise ValueError("This cell does not expose forward_elk.")
+        return self.forward_elk(x=x, initial_state=initial_state)
+
+    if selected_mode == "jacobi":
+        return self.forward_jacobi(x=x, initial_state=initial_state)
+
+    if selected_mode == "picard":
+        return self.forward_picard(x=x, initial_state=initial_state)
+
+    raise ValueError(
+        f"Unknown mode {selected_mode!r}. "
+        "Expected 'sequential', 'deer', 'elk', 'jacobi', or 'picard'."
+    )
+
+
+BaseParaRNNCell.forward_fixed_point_states = _all_algos_forward_fixed_point_states
+BaseParaRNNCell.forward_fixed_point = _all_algos_forward_fixed_point
+BaseParaRNNCell.forward_jacobi = _all_algos_forward_jacobi
+BaseParaRNNCell.forward_picard = _all_algos_forward_picard
+BaseParaRNNCell.forward = _all_algos_base_forward
+
+# === End unified algorithm mode support ===
+
+
+# === Fixed-point accel_scan support ===
+
+from src.algos.FixedPoint import fixed_point_alg_batched as _fp_accel_fixed_point_alg_batched
+
+
+def _fp_accel_forward_fixed_point_states(
+    self,
+    x_batched: torch.Tensor,
+    initial_state_batched: torch.Tensor,
+    *,
+    method: str,
+    fixed_config: Optional[DeerNewtonConfig] = None,
+) -> torch.Tensor:
+    if method not in ("jacobi", "picard"):
+        raise ValueError("method must be 'jacobi' or 'picard'.")
+
+    cfg = self.config.deer if fixed_config is None else fixed_config
+
+    states_guess = self.assemble_initial_guess_batched(
+        drivers=x_batched,
+        initial_state=initial_state_batched,
+        guess_type=getattr(cfg, "initial_guess", "f0"),
+    )
+
+    accel_scan_fn = self._load_accel_scan_if_needed(cfg)
+
+    states, info = _fp_accel_fixed_point_alg_batched(
+        f=self.recurrence_step,
+        initial_state=initial_state_batched,
+        states_guess=states_guess,
+        drivers=x_batched,
+        method=method,
+        num_iters=getattr(cfg, "num_iters", 20),
+        tol=getattr(cfg, "tol", None),
+        clip_value=getattr(cfg, "clip_value", None),
+        return_trace=getattr(cfg, "return_trace", False),
+        strict_tol=getattr(cfg, "strict_tol", False),
+        stopping_criterion=getattr(cfg, "stopping_criterion", "merit"),
+        scan_backend=getattr(cfg, "scan_backend", "torch"),
+        accel_scan_fn=accel_scan_fn,
+    )
+
+    info = dict(info)
+    info["solver"] = method
+    info["backward_backend"] = "autograd"
+    self.last_deer_infos = [info]
+
+    return states
+
+
+BaseParaRNNCell.forward_fixed_point_states = _fp_accel_forward_fixed_point_states
+
+# === End fixed-point accel_scan support ===
