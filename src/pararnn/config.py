@@ -106,3 +106,19 @@ class ParaRNNConfig:
 
 # Backward-compatible name from Phase 1.
 ParaRNNDeerConfig = ParaRNNConfig
+
+# === Native solver extension fields ===
+
+try:
+    DeerNewtonConfig.__annotations__["solver"] = str
+    DeerNewtonConfig.__annotations__["sigmasq"] = float
+    DeerNewtonConfig.__annotations__["process_noise"] = float
+    DeerNewtonConfig.__annotations__["pararnn_deer_kind"] = object
+    DeerNewtonConfig.__annotations__["pararnn_elk_kind"] = object
+    DeerNewtonConfig.__annotations__["paragru_elk_kind"] = object
+    DeerNewtonConfig.__annotations__["paralstm_deer_kind"] = object
+    DeerNewtonConfig.__annotations__["paralstm_elk_kind"] = object
+except Exception:
+    pass
+
+# === End native solver extension fields ===

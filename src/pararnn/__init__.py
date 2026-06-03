@@ -53,8 +53,7 @@ __all__ = [
     "make_paralstm_deer_config",
 ]
 
-
-# === ELK API exports extension ===
+# === Native ELK exports ===
 try:
     from src.pararnn.cells.para_gru import make_paragru_elk_config
     from src.pararnn.cells.para_rnn import make_pararnn_elk_config
@@ -69,4 +68,21 @@ else:
     ]:
         if _name not in __all__:
             __all__.append(_name)
-# === End ELK API exports extension ===
+# === End native ELK exports ===
+
+# === Part-5 fix: exports ===
+try:
+    from src.pararnn.cells.para_gru import make_paragru_elk_config
+    from src.pararnn.cells.para_rnn import make_pararnn_elk_config
+    from src.pararnn.cells.para_lstm import make_paralstm_elk_config
+except ImportError:
+    pass
+else:
+    for _name in [
+        "make_paragru_elk_config",
+        "make_pararnn_elk_config",
+        "make_paralstm_elk_config",
+    ]:
+        if _name not in __all__:
+            __all__.append(_name)
+# === End Part-5 fix: exports ===

@@ -1246,12 +1246,186 @@ except Exception:
 # === End ParaLSTM scalar quasi-DEER extension ===
 
 
-# === ParaLSTM block-2 custom adjoint extension ===
+# === Native ParaLSTM block adjoint and ELK helpers ===
 
+from src.algos.ELK import elk_alg_batched
 from src.pararnn.adjoint import paralstm_block_adjoint_deer_forward
 
 
-def make_paralstm_deer_config(
+def make_paralstm_elk_config(
+    *,
+    num_iters: int = 8,
+    tol: float | None = None,
+    strict_tol: bool = False,
+    initial_guess: str = "f0",
+    scan_backend: str = "torch",
+    accel_module: str = "warp",
+    sigmasq: float = 1e8,
+    process_noise: float = 1.0,
+) -> DeerNewtonConfig:
+    if scan_backend not in ("torch", "accel_scan"):
+        raise ValueError("ParaLSTM quasi-ELK scan_backend must be 'torch' or 'accel_scan'.")
+
+    cfg = DeerNewtonConfig(
+        num_iters=num_iters,
+        tol=tol,
+        strict_tol=strict_tol,
+        stopping_criterion="update",
+        initial_guess=initial_guess,  # type: ignore[arg-type]
+        quasi=True,
+        scan_backend=scan_backend,
+        accel_module=accel_module,
+        jacobian_backend="explicit",
+        backward_backend="autograd",
+    )
+    cfg.solver = "elk"
+    cfg.sigmasq = float(sigmasq)
+    cfg.process_noise = float(process_noise)
+    cfg.paralstm_elk_kind = "scalar_quasi"
+    return cfg
+
+
+def _native_paralstm_forward_block_adjoint_states(
+    self,
+    x_batched: torch.Tensor,
+    initial_state: torch.Tensor,
+    deer_config: DeerNewtonConfig,
+) -> torch.Tensor:
+    cfg = deer_config
+
+    states = paralstm_block_adjoint_deer_forward(
+        drivers=x_batched,
+        initial_state=initial_state,
+        A=self.cell.A,
+        B=self.cell.B,
+        C=self.cell.C,
+        b=self.cell.b,
+        cfg=cfg,
+    )
+
+    with torch.no_grad():
+        initial_blocks = _flat_to_blocks(initial_state, self.hidden_size)
+        final_merit = self._block_deer_merit(
+            initial_blocks=initial_blocks.detach(),
+            states=_flat_to_blocks(states.detach(), self.hidden_size),
+            drivers=x_batched.detach(),
+        )
+
+    self.last_deer_infos = [
+        {
+            "num_iters": cfg.num_iters,
+            "initial_merit": None,
+            "final_merit": final_merit.detach(),
+            "last_update_error": None,
+            "tol": cfg.tol,
+            "effective_tol": None,
+            "strict_tol": cfg.strict_tol,
+            "stopping_criterion": cfg.stopping_criterion,
+            "scan_backend": "torch_block2_associative_scan",
+            "quasi": True,
+            "batched": True,
+            "batch_size": x_batched.shape[0],
+            "jacobian_backend": "explicit_block2",
+            "linearization_backend": "custom_block2",
+            "backward_backend": "adjoint",
+            "cell_variant": "cifg_peephole_diag",
+            "paralstm_deer_kind": "block2",
+            "solver": "deer",
+        }
+    ]
+
+    return states
+
+
+def _native_paralstm_forward_elk_states(
+    self,
+    x_batched: torch.Tensor,
+    initial_state: torch.Tensor,
+    elk_config: DeerNewtonConfig,
+) -> torch.Tensor:
+    cfg = elk_config
+
+    if not cfg.quasi:
+        raise ValueError("ParaLSTM ELK currently supports scalar quasi-ELK only.")
+
+    states_guess = self.assemble_initial_guess_batched(
+        drivers=x_batched,
+        initial_state=initial_state,
+        guess_type=cfg.initial_guess,
+    )
+
+    accel_scan_fn = self._load_accel_scan_if_needed(cfg)
+
+    states, info = elk_alg_batched(
+        f=self.recurrence_step,
+        initial_state=initial_state,
+        states_guess=states_guess,
+        drivers=x_batched,
+        sigmasq=getattr(cfg, "sigmasq", 1e8),
+        process_noise=getattr(cfg, "process_noise", 1.0),
+        num_iters=cfg.num_iters,
+        tol=cfg.tol,
+        quasi=True,
+        damping=cfg.damping,
+        clip_value=cfg.clip_value,
+        return_trace=False,
+        scan_backend=cfg.scan_backend,
+        accel_scan_fn=accel_scan_fn,
+        strict_tol=cfg.strict_tol,
+        stopping_criterion=cfg.stopping_criterion,
+        linearization_fn=self.compute_linearization_diag_from_previous,
+    )
+
+    info = dict(info)
+    info["solver"] = "elk"
+    info["jacobian_backend"] = "explicit_scalar_diag_from_block2"
+    info["linearization_backend"] = "custom_scalar_diag_from_block2"
+    info["backward_backend"] = "autograd"
+    info["cell_variant"] = "cifg_peephole_diag_scalar_quasi_elk"
+    info["paralstm_elk_kind"] = "scalar_quasi"
+    self.last_deer_infos = [info]
+
+    return states
+
+
+def _native_paralstm_forward_deer_states(
+    self,
+    x_batched: torch.Tensor,
+    initial_state: torch.Tensor,
+    deer_config: DeerNewtonConfig,
+) -> torch.Tensor:
+    cfg = deer_config
+
+    if getattr(cfg, "paralstm_deer_kind", "block2") == "block2" and getattr(cfg, "backward_backend", "autograd") == "adjoint":
+        return self._forward_block_adjoint_states(
+            x_batched=x_batched,
+            initial_state=initial_state,
+            deer_config=cfg,
+        )
+
+    return _ParaLSTM_forward_deer_states_original(
+        self,
+        x_batched=x_batched,
+        initial_state=initial_state,
+        deer_config=cfg,
+    )
+
+
+_ParaLSTM_forward_deer_states_original = ParaLSTM.forward_deer_states
+ParaLSTM._forward_block_adjoint_states = _native_paralstm_forward_block_adjoint_states
+ParaLSTM.forward_elk_states = _native_paralstm_forward_elk_states
+ParaLSTM.forward_deer_states = _native_paralstm_forward_deer_states
+
+# === End native ParaLSTM block adjoint and ELK helpers ===
+
+
+# === Part-5 fix: native ELK/adjoint compatibility ===
+
+from src.algos.ELK import elk_alg_batched as _part5_lstm_elk_alg_batched
+from src.pararnn.adjoint import paralstm_block_adjoint_deer_forward as _part5_paralstm_block_adjoint_deer_forward
+
+
+def _part5_make_paralstm_deer_config(
     backend: str = "autograd",
     *,
     num_iters: int = 4,
@@ -1261,21 +1435,6 @@ def make_paralstm_deer_config(
     scan_backend: str = "torch",
     accel_module: str = "warp",
 ) -> DeerNewtonConfig:
-    """Construct a DEER config for ParaLSTM.
-
-    Backends:
-        autograd / block_deer_autograd_torch:
-            exact 2x2 block-DEER with autograd through DEER iterations.
-
-        adjoint / block_deer_adjoint_torch:
-            exact 2x2 block-DEER forward with explicit reverse block adjoint.
-
-        quasi / quasi_autograd / quasi_deer_autograd_torch:
-            approximate scalar quasi-DEER with torch diagonal scan.
-
-        quasi_deer_autograd_accel_scan:
-            approximate scalar quasi-DEER with accelerated_scan.
-    """
     if backend == "block_deer_autograd_torch":
         backend = "autograd"
         scan_backend = "torch"
@@ -1314,6 +1473,7 @@ def make_paralstm_deer_config(
         )
         cfg.jacobian_backend = "explicit"
         cfg.backward_backend = backend
+        cfg.solver = "deer"
         cfg.paralstm_deer_kind = "block2"
         return cfg
 
@@ -1335,6 +1495,7 @@ def make_paralstm_deer_config(
         )
         cfg.jacobian_backend = "explicit"
         cfg.backward_backend = "autograd"
+        cfg.solver = "deer"
         cfg.paralstm_deer_kind = "scalar_quasi"
         return cfg
 
@@ -1346,113 +1507,7 @@ def make_paralstm_deer_config(
     )
 
 
-_ParaLSTM_forward_deer_states_before_block_adjoint = ParaLSTM.forward_deer_states
-
-
-def _paralstm_forward_deer_states_with_block_adjoint(
-    self,
-    x_batched: torch.Tensor,
-    initial_state: torch.Tensor,
-    deer_config: DeerNewtonConfig,
-) -> torch.Tensor:
-    cfg = deer_config
-
-    if (
-        getattr(cfg, "paralstm_deer_kind", "block2") == "block2"
-        and getattr(cfg, "backward_backend", "autograd") == "adjoint"
-    ):
-        if not cfg.quasi:
-            raise ValueError("ParaLSTM block adjoint DEER requires quasi=True.")
-        if cfg.scan_backend != "torch":
-            raise ValueError(
-                "ParaLSTM block adjoint DEER currently supports scan_backend='torch' only."
-            )
-        if getattr(cfg, "jacobian_backend", "explicit") != "explicit":
-            raise ValueError(
-                "ParaLSTM block adjoint DEER requires jacobian_backend='explicit'."
-            )
-        if cfg.return_trace:
-            raise ValueError(
-                "ParaLSTM block adjoint DEER does not support return_trace=True."
-            )
-        if cfg.stopping_criterion not in ("update", "merit"):
-            raise ValueError("stopping_criterion must be 'update' or 'merit'.")
-
-        states = paralstm_block_adjoint_deer_forward(
-            drivers=x_batched,
-            initial_state=initial_state,
-            A=self.cell.A,
-            B=self.cell.B,
-            C=self.cell.C,
-            b=self.cell.b,
-            cfg=cfg,
-        )
-
-        with torch.no_grad():
-            initial_blocks = _flat_to_blocks(initial_state, self.hidden_size)
-            final_merit = self._block_deer_merit(
-                initial_blocks=initial_blocks.detach(),
-                states=_flat_to_blocks(states.detach(), self.hidden_size),
-                drivers=x_batched.detach(),
-            )
-
-        self.last_deer_infos = [
-            {
-                "num_iters": cfg.num_iters,
-                "initial_merit": None,
-                "final_merit": final_merit.detach(),
-                "last_update_error": None,
-                "tol": cfg.tol,
-                "effective_tol": None,
-                "strict_tol": cfg.strict_tol,
-                "stopping_criterion": cfg.stopping_criterion,
-                "scan_backend": "torch_block2_associative_scan",
-                "quasi": True,
-                "batched": True,
-                "batch_size": x_batched.shape[0],
-                "jacobian_backend": "explicit_block2",
-                "linearization_backend": "custom_block2",
-                "backward_backend": "adjoint",
-                "cell_variant": "cifg_peephole_diag",
-                "paralstm_deer_kind": "block2",
-            }
-        ]
-
-        return states
-
-    return _ParaLSTM_forward_deer_states_before_block_adjoint(
-        self,
-        x_batched=x_batched,
-        initial_state=initial_state,
-        deer_config=cfg,
-    )
-
-
-ParaLSTM.forward_deer_states = _paralstm_forward_deer_states_with_block_adjoint
-
-try:
-    ParaLSTMBackend = Literal[
-        "autograd",
-        "block_deer_autograd_torch",
-        "adjoint",
-        "block_deer_adjoint_torch",
-        "quasi",
-        "quasi_autograd",
-        "quasi_deer_autograd_torch",
-        "quasi_deer_autograd_accel_scan",
-    ]
-except Exception:
-    pass
-
-# === End ParaLSTM block-2 custom adjoint extension ===
-
-
-# === ParaLSTM ELK layer API extension ===
-
-from src.algos.ELK import elk_alg_batched
-
-
-def make_paralstm_elk_config(
+def _part5_make_paralstm_elk_config(
     *,
     num_iters: int = 8,
     tol: float | None = None,
@@ -1463,13 +1518,6 @@ def make_paralstm_elk_config(
     sigmasq: float = 1e8,
     process_noise: float = 1.0,
 ) -> DeerNewtonConfig:
-    """Construct a scalar quasi-ELK config for ParaLSTM.
-
-    The exact paper-faithful ParaLSTM state has 2x2 coordinate blocks.
-    This high-level ELK backend uses the existing scalar quasi approximation:
-    it keeps only diag(dc_t/dc_{t-1}) and diag(dh_t/dh_{t-1}) in the flat
-    concat(c,h) state ordering.
-    """
     if scan_backend not in ("torch", "accel_scan"):
         raise ValueError("ParaLSTM quasi-ELK scan_backend must be 'torch' or 'accel_scan'.")
 
@@ -1482,9 +1530,9 @@ def make_paralstm_elk_config(
         quasi=True,
         scan_backend=scan_backend,
         accel_module=accel_module,
-        jacobian_backend="explicit",
-        backward_backend="autograd",
     )
+    cfg.jacobian_backend = "explicit"
+    cfg.backward_backend = "autograd"
     cfg.solver = "elk"
     cfg.sigmasq = float(sigmasq)
     cfg.process_noise = float(process_noise)
@@ -1492,66 +1540,15 @@ def make_paralstm_elk_config(
     return cfg
 
 
-def _paralstm_forward_elk_states(
-    self,
-    x_batched: torch.Tensor,
-    initial_state: torch.Tensor,
-    elk_config: DeerNewtonConfig,
-) -> torch.Tensor:
-    cfg = elk_config
-
-    if not cfg.quasi:
-        raise ValueError("ParaLSTM ELK currently supports scalar quasi-ELK only.")
-
-    if cfg.scan_backend not in ("torch", "accel_scan"):
-        raise ValueError("ParaLSTM quasi-ELK scan_backend must be 'torch' or 'accel_scan'.")
-
-    if getattr(cfg, "jacobian_backend", "explicit") != "explicit":
-        raise ValueError("ParaLSTM quasi-ELK requires jacobian_backend='explicit'.")
-
-    states_guess = self.assemble_initial_guess_batched(
-        drivers=x_batched,
-        initial_state=initial_state,
-        guess_type=cfg.initial_guess,
-    )
-
-    accel_scan_fn = self._load_accel_scan_if_needed(cfg)
-
-    states, info = elk_alg_batched(
-        f=self.recurrence_step,
-        initial_state=initial_state,
-        states_guess=states_guess,
-        drivers=x_batched,
-        sigmasq=getattr(cfg, "sigmasq", 1e8),
-        process_noise=getattr(cfg, "process_noise", 1.0),
-        num_iters=cfg.num_iters,
-        tol=cfg.tol,
-        quasi=True,
-        damping=cfg.damping,
-        clip_value=cfg.clip_value,
-        return_trace=False,
-        scan_backend=cfg.scan_backend,
-        accel_scan_fn=accel_scan_fn,
-        strict_tol=cfg.strict_tol,
-        stopping_criterion=cfg.stopping_criterion,
-        linearization_fn=self.compute_linearization_diag_from_previous,
-    )
-
-    info = dict(info)
-    info["jacobian_backend"] = "explicit_scalar_diag_from_block2"
-    info["linearization_backend"] = "custom_scalar_diag_from_block2"
-    info["backward_backend"] = "autograd"
-    info["cell_variant"] = "cifg_peephole_diag_scalar_quasi_elk"
-    info["paralstm_elk_kind"] = "scalar_quasi"
-    self.last_deer_infos = [info]
-
-    return states
+make_paralstm_deer_config = _part5_make_paralstm_deer_config
+make_paralstm_elk_config = _part5_make_paralstm_elk_config
 
 
-_ParaLSTM_init_before_elk = ParaLSTM.__init__
+if not hasattr(ParaLSTM, "_part5_original_init"):
+    ParaLSTM._part5_original_init = ParaLSTM.__init__
 
 
-def _paralstm_init_with_elk(
+def _part5_paralstm_init(
     self,
     *args,
     solver: str = "deer",
@@ -1574,40 +1571,155 @@ def _paralstm_init_with_elk(
                 sigmasq=elk_sigmasq,
                 process_noise=elk_process_noise,
             )
-        else:
-            cfg = kwargs["deer_config"]
-            cfg.solver = "elk"
-            cfg.sigmasq = float(elk_sigmasq)
-            cfg.process_noise = float(elk_process_noise)
 
-        _ParaLSTM_init_before_elk(self, *args, **kwargs)
+        ParaLSTM._part5_original_init(self, *args, **kwargs)
         self.solver = "elk"
         return
 
-    _ParaLSTM_init_before_elk(self, *args, **kwargs)
+    ParaLSTM._part5_original_init(self, *args, **kwargs)
     self.solver = getattr(self.config.deer, "solver", "deer")
 
 
-_ParaLSTM_forward_before_elk = ParaLSTM.forward
+def _part5_paralstm_forward_block_adjoint_states(
+    self,
+    x_batched: torch.Tensor,
+    initial_state: torch.Tensor,
+    deer_config: DeerNewtonConfig,
+) -> torch.Tensor:
+    cfg = deer_config
+
+    states = _part5_paralstm_block_adjoint_deer_forward(
+        drivers=x_batched,
+        initial_state=initial_state,
+        A=self.cell.A,
+        B=self.cell.B,
+        C=self.cell.C,
+        b=self.cell.b,
+        cfg=cfg,
+    )
+
+    with torch.no_grad():
+        initial_blocks = _flat_to_blocks(initial_state, self.hidden_size)
+        final_merit = self._block_deer_merit(
+            initial_blocks=initial_blocks.detach(),
+            states=_flat_to_blocks(states.detach(), self.hidden_size),
+            drivers=x_batched.detach(),
+        )
+
+    self.last_deer_infos = [
+        {
+            "num_iters": cfg.num_iters,
+            "initial_merit": None,
+            "final_merit": final_merit.detach(),
+            "last_update_error": None,
+            "tol": cfg.tol,
+            "effective_tol": None,
+            "strict_tol": cfg.strict_tol,
+            "stopping_criterion": cfg.stopping_criterion,
+            "scan_backend": "torch_block2_associative_scan",
+            "quasi": True,
+            "batched": True,
+            "batch_size": x_batched.shape[0],
+            "jacobian_backend": "explicit_block2",
+            "linearization_backend": "custom_block2",
+            "backward_backend": "adjoint",
+            "cell_variant": "cifg_peephole_diag",
+            "paralstm_deer_kind": "block2",
+            "solver": "deer",
+        }
+    ]
+
+    return states
 
 
-def _paralstm_forward_with_elk(
+if not hasattr(ParaLSTM, "_part5_original_forward_deer_states"):
+    ParaLSTM._part5_original_forward_deer_states = ParaLSTM.forward_deer_states
+
+
+def _part5_paralstm_forward_deer_states(
+    self,
+    x_batched: torch.Tensor,
+    initial_state: torch.Tensor,
+    deer_config: DeerNewtonConfig,
+) -> torch.Tensor:
+    cfg = deer_config
+
+    if (
+        getattr(cfg, "paralstm_deer_kind", "block2") == "block2"
+        and getattr(cfg, "backward_backend", "autograd") == "adjoint"
+    ):
+        return self._part5_forward_block_adjoint_states(
+            x_batched=x_batched,
+            initial_state=initial_state,
+            deer_config=cfg,
+        )
+
+    return ParaLSTM._part5_original_forward_deer_states(
+        self,
+        x_batched=x_batched,
+        initial_state=initial_state,
+        deer_config=cfg,
+    )
+
+
+def _part5_paralstm_forward_elk_states(
+    self,
+    x_batched: torch.Tensor,
+    initial_state: torch.Tensor,
+    elk_config: DeerNewtonConfig,
+) -> torch.Tensor:
+    cfg = elk_config
+
+    if not cfg.quasi:
+        raise ValueError("ParaLSTM ELK currently supports scalar quasi-ELK only.")
+
+    states_guess = self.assemble_initial_guess_batched(
+        drivers=x_batched,
+        initial_state=initial_state,
+        guess_type=cfg.initial_guess,
+    )
+
+    accel_scan_fn = self._load_accel_scan_if_needed(cfg)
+
+    states, info = _part5_lstm_elk_alg_batched(
+        f=self.recurrence_step,
+        initial_state=initial_state,
+        states_guess=states_guess,
+        drivers=x_batched,
+        sigmasq=getattr(cfg, "sigmasq", 1e8),
+        process_noise=getattr(cfg, "process_noise", 1.0),
+        num_iters=cfg.num_iters,
+        tol=cfg.tol,
+        quasi=True,
+        damping=cfg.damping,
+        clip_value=cfg.clip_value,
+        return_trace=False,
+        scan_backend=cfg.scan_backend,
+        accel_scan_fn=accel_scan_fn,
+        strict_tol=cfg.strict_tol,
+        stopping_criterion=cfg.stopping_criterion,
+        linearization_fn=self.compute_linearization_diag_from_previous,
+    )
+
+    info = dict(info)
+    info["solver"] = "elk"
+    info["jacobian_backend"] = "explicit_scalar_diag_from_block2"
+    info["linearization_backend"] = "custom_scalar_diag_from_block2"
+    info["backward_backend"] = "autograd"
+    info["cell_variant"] = "cifg_peephole_diag_scalar_quasi_elk"
+    info["paralstm_elk_kind"] = "scalar_quasi"
+    self.last_deer_infos = [info]
+
+    return states
+
+
+def _part5_paralstm_forward(
     self,
     input: torch.Tensor,
     hx: tuple[torch.Tensor, torch.Tensor] | None = None,
     *,
-    mode: Literal["sequential", "deer", "elk"] | None = None,
+    mode=None,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-    selected_mode = self.mode if mode is None else mode
-
-    if selected_mode != "elk":
-        return _ParaLSTM_forward_before_elk(
-            self,
-            input=input,
-            hx=hx,
-            mode=mode,
-        )
-
     x_batched, had_batch_dim = self._normalize_input(input)
     unbatched_input = not had_batch_dim
 
@@ -1617,11 +1729,30 @@ def _paralstm_forward_with_elk(
         unbatched_input=unbatched_input,
     )
 
-    states = self.forward_elk_states(
-        x_batched=x_batched,
-        initial_state=initial_state,
-        elk_config=self.config.deer,
-    )
+    selected_mode = self.mode if mode is None else mode
+
+    if selected_mode == "sequential":
+        states = self.batched_sequential_rollout(
+            initial_state=initial_state,
+            drivers=x_batched,
+        )
+    elif selected_mode == "deer":
+        states = self.forward_deer_states(
+            x_batched=x_batched,
+            initial_state=initial_state,
+            deer_config=self.config.deer,
+        )
+    elif selected_mode == "elk":
+        states = self.forward_elk_states(
+            x_batched=x_batched,
+            initial_state=initial_state,
+            elk_config=self.config.deer,
+        )
+    else:
+        raise ValueError(
+            f"Unknown mode {selected_mode!r}. "
+            "Expected 'sequential', 'deer', or 'elk'."
+        )
 
     outputs_batched = self.post_process(states)
     output = self._restore_output_layout(
@@ -1633,8 +1764,10 @@ def _paralstm_forward_with_elk(
     return output, (h_n, c_n)
 
 
-ParaLSTM.forward_elk_states = _paralstm_forward_elk_states
-ParaLSTM.__init__ = _paralstm_init_with_elk
-ParaLSTM.forward = _paralstm_forward_with_elk
+ParaLSTM.__init__ = _part5_paralstm_init
+ParaLSTM._part5_forward_block_adjoint_states = _part5_paralstm_forward_block_adjoint_states
+ParaLSTM.forward_deer_states = _part5_paralstm_forward_deer_states
+ParaLSTM.forward_elk_states = _part5_paralstm_forward_elk_states
+ParaLSTM.forward = _part5_paralstm_forward
 
-# === End ParaLSTM ELK layer API extension ===
+# === End Part-5 fix: native ELK/adjoint compatibility ===

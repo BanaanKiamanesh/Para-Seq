@@ -649,12 +649,12 @@ class BaseParaRNNCell(torch.nn.Module, abc.ABC):
 BaseDeerRNNCell = BaseParaRNNCell
 
 
-# === BaseParaRNNCell ELK layer API extension ===
+# === Native BaseParaRNNCell ELK methods ===
 
 from src.algos.ELK import elk_alg_batched
 
 
-def _base_make_elk_linearization_fn(self, cfg: DeerNewtonConfig):
+def _native_base_make_elk_linearization_fn(self, cfg: DeerNewtonConfig):
     jacobian_backend = getattr(cfg, "jacobian_backend", "autograd")
 
     if jacobian_backend == "autograd":
@@ -672,10 +672,7 @@ def _base_make_elk_linearization_fn(self, cfg: DeerNewtonConfig):
     if not hasattr(self, "compute_linearization_diag_from_previous"):
         return None
 
-    def linearization_fn(
-        previous_states: torch.Tensor,
-        drivers: torch.Tensor,
-    ):
+    def linearization_fn(previous_states: torch.Tensor, drivers: torch.Tensor):
         return self.compute_linearization_diag_from_previous(
             previous_states=previous_states,
             drivers=drivers,
@@ -684,7 +681,7 @@ def _base_make_elk_linearization_fn(self, cfg: DeerNewtonConfig):
     return linearization_fn
 
 
-def _base_forward_elk(
+def _native_base_forward_elk(
     self,
     x: torch.Tensor,
     initial_state: Optional[torch.Tensor] = None,
@@ -730,7 +727,6 @@ def _base_forward_elk(
     info = dict(info)
     info["solver"] = "elk"
     info["backward_backend"] = getattr(cfg, "backward_backend", "autograd")
-
     self.last_deer_infos = [info]
 
     outputs = self.post_process(states)
@@ -741,33 +737,7 @@ def _base_forward_elk(
     )
 
 
-_BaseParaRNNCell_forward_before_elk = BaseParaRNNCell.forward
+BaseParaRNNCell._make_elk_linearization_fn = _native_base_make_elk_linearization_fn
+BaseParaRNNCell.forward_elk = _native_base_forward_elk
 
-
-def _base_forward_with_elk(
-    self,
-    x: torch.Tensor,
-    initial_state: Optional[torch.Tensor] = None,
-    mode: Optional[str] = None,
-) -> torch.Tensor:
-    selected_mode = self.mode if mode is None else mode
-
-    if selected_mode == "elk":
-        return self.forward_elk(
-            x=x,
-            initial_state=initial_state,
-        )
-
-    return _BaseParaRNNCell_forward_before_elk(
-        self,
-        x=x,
-        initial_state=initial_state,
-        mode=mode,
-    )
-
-
-BaseParaRNNCell._make_elk_linearization_fn = _base_make_elk_linearization_fn
-BaseParaRNNCell.forward_elk = _base_forward_elk
-BaseParaRNNCell.forward = _base_forward_with_elk
-
-# === End BaseParaRNNCell ELK layer API extension ===
+# === End native BaseParaRNNCell ELK methods ===

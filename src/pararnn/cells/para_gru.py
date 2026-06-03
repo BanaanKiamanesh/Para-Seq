@@ -667,7 +667,7 @@ class ParaGRU(BaseParaRNNCell):
         )
 
 
-# === ParaGRU ELK layer API extension ===
+# === Native ParaGRU ELK constructor helper ===
 
 def make_paragru_elk_config(
     *,
@@ -680,11 +680,6 @@ def make_paragru_elk_config(
     sigmasq: float = 1e8,
     process_noise: float = 1.0,
 ) -> DeerNewtonConfig:
-    """Construct a quasi-ELK config for ParaGRU.
-
-    ParaGRU has an exact diagonal recurrent Jacobian, so its ELK layer backend
-    is the diagonal/quasi-ELK backend.
-    """
     cfg = DeerNewtonConfig(
         num_iters=num_iters,
         tol=tol,
@@ -704,10 +699,49 @@ def make_paragru_elk_config(
     return cfg
 
 
-_ParaGRU_init_before_elk = ParaGRU.__init__
+# === End native ParaGRU ELK constructor helper ===
 
 
-def _paragru_init_with_elk(
+# === Part-5 fix: native ELK/adjoint compatibility ===
+
+def _part5_make_paragru_elk_config(
+    *,
+    num_iters: int = 8,
+    tol: float | None = None,
+    strict_tol: bool = False,
+    initial_guess: str = "f0",
+    scan_backend: Literal["torch", "accel_scan"] = "torch",
+    accel_module: str = "warp",
+    sigmasq: float = 1e8,
+    process_noise: float = 1.0,
+) -> DeerNewtonConfig:
+    cfg = DeerNewtonConfig(
+        num_iters=num_iters,
+        tol=tol,
+        strict_tol=strict_tol,
+        stopping_criterion="update",
+        initial_guess=initial_guess,  # type: ignore[arg-type]
+        quasi=True,
+        scan_backend=scan_backend,
+        accel_module=accel_module,
+        jacobian_backend="explicit",
+        backward_backend="autograd",
+    )
+    cfg.solver = "elk"
+    cfg.sigmasq = float(sigmasq)
+    cfg.process_noise = float(process_noise)
+    cfg.paragru_elk_kind = "quasi"
+    return cfg
+
+
+make_paragru_elk_config = _part5_make_paragru_elk_config
+
+
+if not hasattr(ParaGRU, "_part5_original_init"):
+    ParaGRU._part5_original_init = ParaGRU.__init__
+
+
+def _part5_paragru_init(
     self,
     *args,
     solver: str = "deer",
@@ -730,47 +764,42 @@ def _paragru_init_with_elk(
                 sigmasq=elk_sigmasq,
                 process_noise=elk_process_noise,
             )
-        else:
-            cfg = kwargs["deer_config"]
-            cfg.solver = "elk"
-            cfg.sigmasq = float(elk_sigmasq)
-            cfg.process_noise = float(elk_process_noise)
 
-        _ParaGRU_init_before_elk(self, *args, **kwargs)
+        ParaGRU._part5_original_init(self, *args, **kwargs)
         self.solver = "elk"
         return
 
-    _ParaGRU_init_before_elk(self, *args, **kwargs)
+    ParaGRU._part5_original_init(self, *args, **kwargs)
     self.solver = getattr(self.config.deer, "solver", "deer")
 
 
-_ParaGRU_forward_before_elk = ParaGRU.forward
-
-
-def _paragru_forward_with_elk(
+def _part5_paragru_forward(
     self,
     input: torch.Tensor,
     hx: torch.Tensor | None = None,
     *,
-    mode: Literal["sequential", "deer", "elk"] | None = None,
+    mode=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    initial_state, unbatched_input = self._hx_to_initial_state(input, hx)
     selected_mode = self.mode if mode is None else mode
 
-    if selected_mode == "elk":
-        initial_state, unbatched_input = self._hx_to_initial_state(input, hx)
+    if selected_mode == "sequential":
+        output = self.forward_sequential(input, initial_state=initial_state)
+    elif selected_mode == "deer":
+        output = self.forward_deer(input, initial_state=initial_state)
+    elif selected_mode == "elk":
         output = self.forward_elk(input, initial_state=initial_state)
-        h_n = self._make_h_n(output, unbatched_input=unbatched_input)
-        return output, h_n
+    else:
+        raise ValueError(
+            f"Unknown mode {selected_mode!r}. "
+            "Expected 'sequential', 'deer', or 'elk'."
+        )
 
-    return _ParaGRU_forward_before_elk(
-        self,
-        input=input,
-        hx=hx,
-        mode=mode,
-    )
+    h_n = self._make_h_n(output, unbatched_input=unbatched_input)
+    return output, h_n
 
 
-ParaGRU.__init__ = _paragru_init_with_elk
-ParaGRU.forward = _paragru_forward_with_elk
+ParaGRU.__init__ = _part5_paragru_init
+ParaGRU.forward = _part5_paragru_forward
 
-# === End ParaGRU ELK layer API extension ===
+# === End Part-5 fix: native ELK/adjoint compatibility ===
