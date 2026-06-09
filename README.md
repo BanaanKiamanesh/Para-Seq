@@ -8,27 +8,30 @@ The project implements fixed-point and Newton-style algorithms such as **Jacobi,
 
 ```text
 src/
-├── algos/        # DEER, ELK, Jacobi, Picard, fixed-point solvers
-├── pararnn/      # PyTorch-style ParaRNN, ParaGRU, ParaLSTM layers
-└── utils/        # associative scans, accelerated_scan wrappers, adjoint scans
+├── algos/         # DEER, ELK, Jacobi, Picard, fixed-point solvers
+├── ode_solvers/   # scan-based linear and nonlinear fixed-step ODE solvers
+├── pararnn/       # PyTorch-style ParaRNN, ParaGRU, ParaLSTM layers
+└── utils/         # associative scans, accelerated_scan wrappers, adjoint scans
 
 test/
+├── ode_solvers/  # ODE solver correctness tests
 ├── pararnn/      # correctness, gradient, backend, and layer API tests
 ├── utils/        # scan backend tests
-└── bench/        # benchmarking scripts and logs
+└── bench/        # benchmark suites, README files, scripts, and logs
 
 notebooks/        # small demos and Sequential MNIST experiments
 ```
 
 ## Main features
 
-| Component   | Description                                                                                                  |
-| ----------- | ------------------------------------------------------------------------------------------------------------ |
-| `ParaRNN`   | Vanilla tanh/relu RNN with sequential and DEER-style modes.                                                  |
-| `ParaGRU`   | Diagonal ParaGRU with quasi-DEER, optional adjoint backward, and optional `accelerated_scan` support.        |
-| `ParaLSTM`  | CIFG/peephole-style ParaLSTM with structured block and diagonal scan backends.                               |
-| `src.algos` | Standalone solvers for sequential rollout, Jacobi, Picard, DEER, quasi-DEER, ELK, and quasi-ELK experiments. |
-| `src.utils` | Dense, diagonal, and 2x2 block associative scans, plus reverse adjoint scans.                                |
+| Component         | Description                                                                                                  |
+| ----------------- | ------------------------------------------------------------------------------------------------------------ |
+| `ParaRNN`         | Vanilla tanh/relu RNN with sequential and DEER-style modes.                                                  |
+| `ParaGRU`         | Diagonal ParaGRU with quasi-DEER, optional adjoint backward, and optional `accelerated_scan` support.        |
+| `ParaLSTM`        | CIFG/peephole-style ParaLSTM with structured block and diagonal scan backends.                               |
+| `src.algos`       | Standalone solvers for sequential rollout, Jacobi, Picard, DEER, quasi-DEER, ELK, and quasi-ELK experiments. |
+| `src.ode_solvers` | Fixed-step linear simulation and nonlinear ODE solvers using scan-based parallel rollouts.                   |
+| `src.utils`       | Dense, diagonal, and 2x2 block associative scans, plus reverse adjoint scans.                                |
 
 ## Installation
 
@@ -88,29 +91,48 @@ rnn = ParaGRU(
 ).to("cuda")
 ```
 
+For fixed-step ODE experiments:
+
+```python
+import torch
+from src.ode_solvers import lsim
+
+t = torch.linspace(0.0, 1.0, 128)
+U = torch.zeros(128, 1)
+A = torch.tensor([[-0.5]])
+B = torch.tensor([[1.0]])
+C = torch.tensor([[1.0]])
+D = torch.tensor([[0.0]])
+
+y, x = lsim(A, B, C, D, U, t, scan_backend="torch")
+```
+
 ## Running tests
 
 ```bash
-pytest test/pararnn test/utils -q
+pytest test/pararnn test/utils test/ode_solvers -q
 ```
 
-The tests check forward correctness, gradient equivalence, layer API behavior, scan backends, adjoint scans, and several DEER/ELK configurations.
+The tests check forward correctness, gradient equivalence, layer API behavior, scan backends, adjoint scans, ODE solver correctness, and several DEER/ELK configurations.
 
 ## Running benchmarks
 
+Benchmark documentation lives in `test/bench/README.md` and the README in each benchmark subfolder.
+
 ```bash
-python test/bench/algos/benchmarking.py \
-    --algorithms sequential,deer,quasi_deer,picard,jacobi,elk,quasi_elk \
-    --device cuda \
-    --dtype float32 \
-    --scan-backend accel_scan
+PYTHONPATH=. python test/bench/algos/benchmarking.py --max-seq-len 4096
+PYTHONPATH=. python test/bench/baseline/strong_baselines.py --repeats 2
+python test/bench/ode_solvers/heavy_benchmark.py --profile quick
 ```
 
-Benchmark logs and CSV files are written under:
+The benchmark folders also include bash entry points for larger runs:
 
-```text
-test/bench/algos/logs/
+```bash
+bash test/bench/algos/benchmarking.sh
+ODE_BENCH_PROFILE=quick bash test/bench/ode_solvers/run_ode_benchmarks.sh
 ```
+
+Benchmark logs and CSV files are written under the corresponding `test/bench/*/logs/` folders.
 
 ## Demos
 
@@ -118,6 +140,7 @@ The `notebooks/` folder contains small training and comparison demos, including:
 
 * synthetic drift classification,
 * synthetic memory with ParaLSTM,
+* linear and nonlinear ODE solver examples,
 * Sequential MNIST and permuted Sequential MNIST experiments,
 * ParaGRU and ParaLSTM examples using quasi-DEER and `accelerated_scan`.
 
@@ -130,6 +153,7 @@ Current limitations include:
 * single recurrent layer only,
 * unidirectional models only,
 * dropout is not implemented for the ParaRNN/ParaGRU/ParaLSTM layers,
+* ODE solvers currently target fixed-step time grids,
 * full dense DEER is mainly practical for small hidden sizes,
 * `accelerated_scan` requires CUDA,
 * imports currently assume the repo root is available as a Python path.
