@@ -13,3 +13,4 @@ notebooks/data/
 *.py.bak.*
 *backup*
 *.accel_*
+notebooks/Carleman Lifting/Carleman_Benchmarking_results.csv
